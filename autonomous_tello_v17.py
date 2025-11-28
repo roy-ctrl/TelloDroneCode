@@ -1,16 +1,18 @@
 """
-Tello EDU: Autonomous V16.0 "Veering & Speed Enhanced"
-======================================================
+Tello EDU: Autonomous V17.0 "Adaptive Speed + Advanced Pathfinding"
+===================================================================
 Hardware: RTX 4060 8GB VRAM | Python 3.13
 
-NEW FEATURES IN V16.0:
-1. 50% FASTER SPEEDS: All movement speeds increased for snappier flight
-2. ALWAYS-ON PATH VISUALIZATION: Path always displayed, auto-sets default target
-3. CEILING DETECTION: Prevents crashing into ceiling with height limits
-4. VEERING BEHAVIOR: Smooth obstacle avoidance while maintaining forward motion
-5. REDUCED BOBBING: Less vertical oscillation during flight
+NEW FEATURES IN V17.0:
+1. ADAPTIVE SPEED CONTROL: Speed automatically adjusts based on obstacle proximity
+   - FAST mode when clear (>2.5m), CRUISE when cautious (1.5-2.5m), SLOW when danger (<1.5m)
+2. CEILING PROTECTION: Strict altitude hold during rotation/exploration to prevent ceiling crashes
+3. IMPROVED PATHFINDING: A* + String Pulling + B-Spline smoothing for smoother paths
+4. LOW-LATENCY VIDEO: Optimized OpenCV capture with reduced buffer and FFMPEG settings
+5. ALTITUDE LOCK DURING ROTATION: Prevents rising during 360° rotations
 
-RETAINED FROM V15.0:
+RETAINED FROM V16.0:
+- VEERING BEHAVIOR: Smooth obstacle avoidance while maintaining forward motion
 - OFFLINE MODE: No HuggingFace retry delays
 - OPEN3D VISUALIZATION: Working 3D floor map
 - PATH PROJECTION: Walkable path on camera view
@@ -48,6 +50,16 @@ import torch.nn.functional as F
 import pygame
 from djitellopy import Tello
 from ultralytics import YOLOWorld
+
+# Import scipy for B-spline path smoothing
+try:
+    from scipy import interpolate
+    SCIPY_AVAILABLE = True
+    print("[PATH] SciPy available for B-spline path smoothing")
+except ImportError:
+    SCIPY_AVAILABLE = False
+    print("[PATH] SciPy not available - B-spline smoothing disabled")
+    print("      Install with: pip install scipy")
 
 # Try to import Open3D for 3D visualization
 try:
@@ -117,37 +129,60 @@ FLOOR_CLASS_IDS = {
     13: "ground",         # earth, ground
 }
 
-# Obstacle Avoidance Thresholds (meters)
-EMERGENCY_STOP_DIST = 0.5   # Reduced for faster response
-CRITICAL_DIST = 0.8
-DANGER_DIST = 1.1
-CAUTION_DIST = 1.6
-SAFE_DIST = 2.2
+# ==========================================
+# V17 OBSTACLE DISTANCE THRESHOLDS (meters)
+# ==========================================
+EMERGENCY_STOP_DIST = 0.5   # Emergency stop
+CRITICAL_DIST = 0.8         # Critical - must turn
+DANGER_DIST = 1.2           # Danger zone - slow speed
+CAUTION_DIST = 1.8          # Caution zone - reduced speed  
+SAFE_DIST = 2.5             # Safe zone - can cruise
+CLEAR_DIST = 3.5            # All clear - can go fast
 
 # ==========================================
-# V16 SPEED LIMITS (50% FASTER)
+# V17 ADAPTIVE SPEED SYSTEM
 # ==========================================
-SPEED_MAX = 70           # Was 45
-SPEED_CRUISE = 45        # Was 30
-SPEED_CAREFUL = 28       # Was 18
-SPEED_CREEP = 15         # Was 10
-SPEED_STOP = 0
-SPEED_VERTICAL = 35      # Was 25
-SPEED_YAW = 55           # Was 40
-SPEED_ESCAPE_YAW = 75    # Was 55
-SPEED_APPROACH = 20      # Was 12
+class SpeedMode(Enum):
+    STOP = "STOP"
+    CREEP = "CREEP"
+    SLOW = "SLOW"
+    CRUISE = "CRUISE"
+    FAST = "FAST"
+
+# Speed values for each mode
+SPEED_VALUES = {
+    SpeedMode.STOP: 0,
+    SpeedMode.CREEP: 12,
+    SpeedMode.SLOW: 22,
+    SpeedMode.CRUISE: 38,
+    SpeedMode.FAST: 60,
+}
+
+# Yaw speeds
+SPEED_YAW_SLOW = 35
+SPEED_YAW_NORMAL = 50
+SPEED_YAW_FAST = 70
+SPEED_ESCAPE_YAW = 75
+
+# Vertical speeds
+SPEED_VERTICAL = 30
+SPEED_VERTICAL_SLOW = 15
 
 # Veering speeds (lateral movement while going forward)
-SPEED_VEER_LATERAL = 25  # Lateral speed for veering
-SPEED_VEER_FORWARD = 35  # Forward speed while veering
+SPEED_VEER_LATERAL = 25
+
+# Approach speed
+SPEED_APPROACH = 18
 
 # ==========================================
-# V16 CEILING DETECTION
+# V17 STRICT CEILING PROTECTION
 # ==========================================
-CEILING_MIN_DIST = 0.5          # Minimum distance to ceiling (meters)
-CEILING_CAUTION_DIST = 0.8      # Start slowing vertical when closer
-MAX_ALTITUDE = 2.0              # Maximum allowed altitude (meters)
+CEILING_MIN_DIST = 0.4          # Minimum distance to ceiling (meters)
+CEILING_CAUTION_DIST = 0.7      # Start slowing vertical when closer
+MAX_ALTITUDE = 1.8              # Maximum allowed altitude (meters) - stricter
 MIN_ALTITUDE = 0.3              # Minimum altitude to maintain
+ALTITUDE_HOLD_TOLERANCE = 0.15  # Tolerance for altitude hold during rotation (meters)
+ROTATION_ALTITUDE_LOCK = True   # Lock altitude during rotation
 
 # Corner escape thresholds
 CORNER_LEFT_THRESHOLD = 1.5
@@ -180,6 +215,7 @@ VO_IMU_WEIGHT = 0.3
 STUCK_THRESH = 0.15
 STUCK_TIME = 3.0
 CORNER_STUCK_TIME = 2.0
+CORNER_ESCAPE_TIMEOUT = 4.0  # V18: Max seconds to spend in corner escape before forcing exit
 
 # Segmentation settings
 SEG_INFERENCE_INTERVAL = 5  # Run segmentation every N frames
@@ -188,6 +224,14 @@ SEG_INPUT_SIZE = 512        # Resize input for faster inference
 # Path planning
 PATH_UPDATE_INTERVAL = 0.5  # Faster path updates (was 1.0)
 DEFAULT_TARGET_DISTANCE = 5.0  # Default target 5m ahead
+
+# ==========================================
+# V17 PATH SMOOTHING PARAMETERS
+# ==========================================
+PATH_STRING_PULL_ENABLED = True   # Enable string pulling optimization
+PATH_BSPLINE_ENABLED = True       # Enable B-spline smoothing
+PATH_BSPLINE_SAMPLES = 50         # Number of samples for B-spline
+PATH_BSPLINE_SMOOTHNESS = 0.0     # 0 = interpolate through points
 
 # Path visualization
 PATH_LINE_COLOR = (0, 255, 255)  # Yellow
@@ -198,14 +242,26 @@ PATH_LINE_THICKNESS = 3
 PATH_POINT_RADIUS = 8
 
 # Vertical stability (reduce bobbing)
-VERTICAL_DEADZONE = 0.08  # Ignore small vertical errors
-VERTICAL_DAMPING = 0.6    # Reduce vertical oscillation
+VERTICAL_DEADZONE = 0.10  # Ignore small vertical errors
+VERTICAL_DAMPING = 0.5    # Reduce vertical oscillation
+
+# ==========================================
+# V17 LOW-LATENCY VIDEO SETTINGS
+# ==========================================
+VIDEO_BUFFER_SIZE = 1           # Minimum buffer
+VIDEO_FPS = 30                  # Target FPS
+VIDEO_GRAB_TIMEOUT_MS = 50      # Timeout for frame grab
+VIDEO_FFLAGS = "nobuffer"       # FFMPEG flags for low latency
+VIDEO_PROBESIZE = "32"          # Reduce probe size for faster start
+VIDEO_ANALYZEDURATION = "0"     # Don't analyze duration
 
 # Logging
 logging.getLogger('djitellopy').setLevel(logging.ERROR)
 logging.getLogger("ultralytics").setLevel(logging.WARNING)
 logging.getLogger("transformers").setLevel(logging.WARNING)
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
+
+# Set FFMPEG options for low latency
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp|fflags;nobuffer|flags;low_delay|framedrop;1|strict;experimental"
 
 
 # ==========================================
@@ -220,14 +276,17 @@ class EscapeState(Enum):
 
 
 # ==========================================
-# THREADED CAMERA
+# THREADED CAMERA (Simple, Low-Latency)
 # ==========================================
 class ThreadedCam:
-    """Thread-safe camera capture."""
+    """Thread-safe camera capture - simple and low-latency."""
     
     def __init__(self, src: str = "udp://@0.0.0.0:11111"):
         self.src = src
         self.cap = cv2.VideoCapture(self.src, cv2.CAP_FFMPEG)
+        self.fps = 0
+        self.frame_count = 0
+        self.fps_start_time = time.time()
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.grabbed, self.frame = self.cap.read()
         self.started = False
@@ -247,9 +306,21 @@ class ThreadedCam:
             if grabbed:
                 with self.lock:
                     self.grabbed, self.frame = grabbed, frame
+                    self.frame_count += 1
+                    
+                    # Update FPS every second
+                    elapsed = time.time() - self.fps_start_time
+                    if elapsed > 1.0:
+                        self.fps = self.frame_count / elapsed
+                        self.frame_count = 0
+                        self.fps_start_time = time.time()
             else:
                 time.sleep(0.01)
 
+
+    def get_fps(self) -> float:
+        with self.lock:
+            return self.fps
     def read(self) -> Optional[np.ndarray]:
         with self.lock:
             return self.frame.copy() if self.frame is not None else None
@@ -681,11 +752,14 @@ class PathProjectionEngine:
 
 
 # ==========================================
-# A* PATHFINDING
+# V17 IMPROVED A* PATHFINDING WITH STRING PULLING + B-SPLINE
 # ==========================================
 class AStarPathfinder:
     """
-    A* pathfinding algorithm for finding walkable paths on the floor grid.
+    A* pathfinding algorithm with V17 improvements:
+    1. A* search for initial path
+    2. String Pulling: Raycast from A to C; if clear, delete B
+    3. B-Spline smoothing for rounded corners
     """
     
     def __init__(self, grid_size: int = FLOOR_GRID_SIZE):
@@ -707,7 +781,10 @@ class AStarPathfinder:
     
     def find_path(self, floor_grid: np.ndarray, start: Tuple[int, int], 
                   goal: Tuple[int, int], obstacle_grid: np.ndarray = None) -> List[Tuple[int, int]]:
-        """Find path from start to goal on floor grid."""
+        """
+        Find path from start to goal on floor grid.
+        V17: Now includes string pulling and B-spline smoothing.
+        """
         if not self._is_valid(start, floor_grid, obstacle_grid):
             start = self._find_nearest_valid(start, floor_grid, obstacle_grid)
             if start is None:
@@ -718,6 +795,29 @@ class AStarPathfinder:
             if goal is None:
                 return []
         
+        # Step 1: Run A* to get initial path
+        raw_path = self._astar_search(floor_grid, start, goal, obstacle_grid)
+        
+        if not raw_path:
+            return []
+        
+        # Step 2: String Pulling - Remove unnecessary waypoints
+        if PATH_STRING_PULL_ENABLED and len(raw_path) > 2:
+            pulled_path = self._string_pull(raw_path, floor_grid, obstacle_grid)
+        else:
+            pulled_path = raw_path
+        
+        # Step 3: B-Spline smoothing for rounded corners
+        if PATH_BSPLINE_ENABLED and SCIPY_AVAILABLE and len(pulled_path) > 3:
+            smoothed_path = self._bspline_smooth(pulled_path)
+        else:
+            smoothed_path = pulled_path
+        
+        return smoothed_path
+    
+    def _astar_search(self, floor_grid: np.ndarray, start: Tuple[int, int],
+                      goal: Tuple[int, int], obstacle_grid: np.ndarray) -> List[Tuple[int, int]]:
+        """Core A* search algorithm."""
         open_set = []
         heapq.heappush(open_set, (0, start))
         
@@ -743,7 +843,7 @@ class AStarPathfinder:
                     current = came_from[current]
                 path.append(start)
                 path.reverse()
-                return self._smooth_path(path, floor_grid, obstacle_grid)
+                return path
             
             for i, (dx, dz) in enumerate(self.directions):
                 neighbor = (current[0] + dx, current[1] + dz)
@@ -763,6 +863,79 @@ class AStarPathfinder:
                         open_set_hash.add(neighbor)
         
         return []
+    
+    def _string_pull(self, path: List[Tuple[int, int]], floor_grid: np.ndarray,
+                     obstacle_grid: np.ndarray) -> List[Tuple[int, int]]:
+        """
+        V17: String Pulling Algorithm
+        Raycast from point A to C; if clear, remove B.
+        This removes unnecessary zig-zags from the path.
+        """
+        if len(path) <= 2:
+            return path
+        
+        pulled = [path[0]]  # Start with first point
+        current_idx = 0
+        
+        while current_idx < len(path) - 1:
+            # Try to find the furthest point we can see directly
+            furthest_visible = current_idx + 1
+            
+            for check_idx in range(len(path) - 1, current_idx + 1, -1):
+                if self._line_of_sight(path[current_idx], path[check_idx], 
+                                       floor_grid, obstacle_grid):
+                    furthest_visible = check_idx
+                    break
+            
+            pulled.append(path[furthest_visible])
+            current_idx = furthest_visible
+        
+        return pulled
+    
+    def _bspline_smooth(self, path: List[Tuple[int, int]], 
+                        num_samples: int = PATH_BSPLINE_SAMPLES) -> List[Tuple[int, int]]:
+        """
+        V17: B-Spline smoothing using scipy
+        Rounds sharp corners for smoother drone movement.
+        """
+        if len(path) < 4:
+            return path
+        
+        try:
+            # Extract x and z coordinates
+            x = np.array([p[0] for p in path], dtype=float)
+            z = np.array([p[1] for p in path], dtype=float)
+            
+            # Create parametric representation
+            # Use splprep for parametric splines
+            tck, u = interpolate.splprep([x, z], s=PATH_BSPLINE_SMOOTHNESS, k=min(3, len(path)-1))
+            
+            # Evaluate spline at many points for smooth curve
+            u_new = np.linspace(0, 1, num_samples)
+            smooth_coords = interpolate.splev(u_new, tck)
+            
+            # Convert back to integer grid coordinates
+            smoothed_path = []
+            for sx, sz in zip(smooth_coords[0], smooth_coords[1]):
+                # Clamp to grid bounds
+                gx = int(np.clip(round(sx), 0, self.grid_size - 1))
+                gz = int(np.clip(round(sz), 0, self.grid_size - 1))
+                
+                # Avoid duplicate consecutive points
+                if not smoothed_path or (gx, gz) != smoothed_path[-1]:
+                    smoothed_path.append((gx, gz))
+            
+            # Ensure start and end points are preserved exactly
+            if smoothed_path and smoothed_path[0] != path[0]:
+                smoothed_path[0] = path[0]
+            if smoothed_path and smoothed_path[-1] != path[-1]:
+                smoothed_path[-1] = path[-1]
+            
+            return smoothed_path
+            
+        except Exception as e:
+            print(f"[PATH] B-spline smoothing failed: {e}")
+            return path
     
     def _is_valid(self, pos: Tuple[int, int], floor_grid: np.ndarray, 
                   obstacle_grid: np.ndarray = None) -> bool:
@@ -791,29 +964,12 @@ class AStarPathfinder:
                         return candidate
         return None
     
-    def _smooth_path(self, path: List[Tuple[int, int]], floor_grid: np.ndarray,
-                     obstacle_grid: np.ndarray = None) -> List[Tuple[int, int]]:
-        if len(path) <= 2:
-            return path
-        
-        smoothed = [path[0]]
-        i = 0
-        
-        while i < len(path) - 1:
-            j = len(path) - 1
-            
-            while j > i + 1:
-                if self._line_of_sight(path[i], path[j], floor_grid, obstacle_grid):
-                    break
-                j -= 1
-            
-            smoothed.append(path[j])
-            i = j
-        
-        return smoothed
-    
     def _line_of_sight(self, p1: Tuple[int, int], p2: Tuple[int, int],
                        floor_grid: np.ndarray, obstacle_grid: np.ndarray = None) -> bool:
+        """
+        Bresenham's line algorithm to check line of sight.
+        Returns True if there's a clear path from p1 to p2.
+        """
         x1, z1 = p1
         x2, z2 = p2
         
@@ -869,7 +1025,7 @@ class FloorMap3D:
         self.pathfinder = AStarPathfinder(FLOOR_GRID_SIZE)
         self.lock = threading.Lock()
         
-        print("[FLOOR MAP] 3D Floor map initialized")
+        print("[FLOOR MAP] 3D Floor map initialized with V17 pathfinding")
     
     def update(self, depth_meters: np.ndarray, floor_mask: np.ndarray,
                pos_x: float, pos_y: float, pos_z: float, yaw: float):
@@ -1118,7 +1274,7 @@ class Open3DVisualizer:
     def _run(self):
         try:
             self.vis = o3d.visualization.Visualizer()
-            self.vis.create_window("Floor Map 3D - V16", width=1024, height=768)
+            self.vis.create_window("Floor Map 3D - V17", width=1024, height=768)
             
             self.pcd_floor = o3d.geometry.PointCloud()
             self.pcd_scene = o3d.geometry.PointCloud()
@@ -1262,11 +1418,11 @@ class Open3DVisualizer:
 
 
 # ==========================================
-# ENHANCED OBSTACLE DETECTOR WITH CEILING
+# V17 ENHANCED OBSTACLE DETECTOR WITH ADAPTIVE SPEED
 # ==========================================
 @dataclass
 class ObstacleInfo:
-    """Structured obstacle detection with ceiling support."""
+    """Structured obstacle detection with V17 adaptive speed support."""
     center_dist: float = 10.0
     left_dist: float = 10.0
     right_dist: float = 10.0
@@ -1283,11 +1439,12 @@ class ObstacleInfo:
     is_critical: bool = False
     is_danger: bool = False
     is_caution: bool = False
+    is_clear: bool = True
     
     is_corner: bool = False
     corner_type: str = ""
     
-    # V16: Ceiling detection
+    # V17: Ceiling detection
     ceiling_detected: bool = False
     ceiling_dist: float = 10.0
     
@@ -1298,13 +1455,20 @@ class ObstacleInfo:
     
     escape_rotation: int = 0
     
-    # V16: Veering recommendation
+    # V17: Veering recommendation
     veer_direction: str = "none"  # "left", "right", "none"
     veer_strength: float = 0.0   # 0.0 to 1.0
+    
+    # V17: Adaptive speed mode
+    speed_mode: SpeedMode = SpeedMode.CRUISE
+    recommended_speed: int = 30
 
 
 class EnhancedObstacleDetector:
-    """Multi-zone obstacle detection with ceiling and veering support."""
+    """
+    V17: Multi-zone obstacle detection with adaptive speed control.
+    Automatically adjusts speed based on obstacle proximity.
+    """
     
     def __init__(self):
         self.history: Deque[ObstacleInfo] = deque(maxlen=5)
@@ -1369,7 +1533,7 @@ class EnhancedObstacleDetector:
     def _compute_veering(self, column_dists: List[float], left_dist: float, 
                          right_dist: float) -> Tuple[str, float]:
         """
-        V16: Compute veering direction and strength for smooth obstacle avoidance.
+        Compute veering direction and strength for smooth obstacle avoidance.
         Returns (direction, strength) where direction is "left", "right", or "none"
         and strength is 0.0 to 1.0.
         """
@@ -1402,8 +1566,39 @@ class EnhancedObstacleDetector:
             strength = min(1.0, (CAUTION_DIST - center_avg) / CAUTION_DIST)
             return "right", strength
     
+    def _compute_adaptive_speed(self, center_dist: float, min_dist: float) -> Tuple[SpeedMode, int]:
+        """
+        V17: Compute adaptive speed based on obstacle proximity.
+        Returns (speed_mode, recommended_speed).
+        """
+        # Use the more restrictive of center and min distance
+        effective_dist = min(center_dist, min_dist * 1.2)
+        
+        if effective_dist < EMERGENCY_STOP_DIST:
+            return SpeedMode.STOP, SPEED_VALUES[SpeedMode.STOP]
+        elif effective_dist < CRITICAL_DIST:
+            return SpeedMode.CREEP, SPEED_VALUES[SpeedMode.CREEP]
+        elif effective_dist < DANGER_DIST:
+            return SpeedMode.SLOW, SPEED_VALUES[SpeedMode.SLOW]
+        elif effective_dist < CAUTION_DIST:
+            # Interpolate between SLOW and CRUISE
+            factor = (effective_dist - DANGER_DIST) / (CAUTION_DIST - DANGER_DIST)
+            speed = int(SPEED_VALUES[SpeedMode.SLOW] + 
+                       factor * (SPEED_VALUES[SpeedMode.CRUISE] - SPEED_VALUES[SpeedMode.SLOW]))
+            return SpeedMode.CRUISE, speed
+        elif effective_dist < SAFE_DIST:
+            return SpeedMode.CRUISE, SPEED_VALUES[SpeedMode.CRUISE]
+        elif effective_dist < CLEAR_DIST:
+            # Interpolate between CRUISE and FAST
+            factor = (effective_dist - SAFE_DIST) / (CLEAR_DIST - SAFE_DIST)
+            speed = int(SPEED_VALUES[SpeedMode.CRUISE] + 
+                       factor * (SPEED_VALUES[SpeedMode.FAST] - SPEED_VALUES[SpeedMode.CRUISE]))
+            return SpeedMode.FAST, speed
+        else:
+            return SpeedMode.FAST, SPEED_VALUES[SpeedMode.FAST]
+    
     def analyze(self, depth_meters: np.ndarray, current_altitude: float = 1.0) -> ObstacleInfo:
-        """Analyze depth map for obstacles including ceiling."""
+        """Analyze depth map for obstacles with V17 adaptive speed."""
         h, w = depth_meters.shape
         info = ObstacleInfo()
         
@@ -1455,7 +1650,7 @@ class EnhancedObstacleDetector:
         info.top_dist = zone_dists.get('top', 10.0)
         info.bottom_dist = zone_dists.get('bottom', 10.0)
         
-        # V16: Ceiling detection
+        # V17: Ceiling detection
         info.ceiling_dist = info.top_dist
         info.ceiling_detected = (info.top_dist < CEILING_CAUTION_DIST or 
                                  current_altitude > MAX_ALTITUDE - 0.3)
@@ -1471,6 +1666,7 @@ class EnhancedObstacleDetector:
         info.is_critical = info.center_dist < CRITICAL_DIST
         info.is_danger = info.center_dist < DANGER_DIST
         info.is_caution = info.center_dist < CAUTION_DIST
+        info.is_clear = info.center_dist > SAFE_DIST and info.min_dist > CAUTION_DIST
         
         info.is_corner, info.corner_type = self._detect_corner(
             info.left_dist, info.right_dist, info.center_dist)
@@ -1480,7 +1676,7 @@ class EnhancedObstacleDetector:
         else:
             self.corner_frames = max(0, self.corner_frames - 1)
         
-        # V16: Enhanced ceiling-aware vertical limits
+        # V17: Strict ceiling-aware vertical limits
         info.can_go_up = (info.top_dist > CEILING_MIN_DIST and 
                           current_altitude < MAX_ALTITUDE - 0.2 and
                           not info.ceiling_detected)
@@ -1494,9 +1690,14 @@ class EnhancedObstacleDetector:
             else:
                 info.escape_rotation = SPEED_ESCAPE_YAW if info.right_dist >= info.left_dist else -SPEED_ESCAPE_YAW
         
-        # V16: Compute veering recommendation
+        # V17: Compute veering recommendation
         info.veer_direction, info.veer_strength = self._compute_veering(
             info.column_dists, info.left_dist, info.right_dist
+        )
+        
+        # V17: Compute adaptive speed
+        info.speed_mode, info.recommended_speed = self._compute_adaptive_speed(
+            info.center_dist, info.min_dist
         )
         
         best_col_idx = int(np.argmax(info.column_dists))
@@ -1681,15 +1882,18 @@ class EnhancedVisualOdometry:
 
 
 # ==========================================
-# SAFE VOXEL BRAIN V16 WITH VEERING
+# V17 SAFE VOXEL BRAIN WITH ADAPTIVE SPEED
 # ==========================================
 class SafeVoxelBrain:
     """
-    V16: Enhanced with veering behavior, ceiling detection, and faster speeds.
+    V17: Enhanced brain with:
+    1. Adaptive speed control based on obstacle proximity
+    2. Strict altitude hold during rotation (no more ceiling crashes)
+    3. Improved pathfinding with string pulling + B-spline
     """
     
     def __init__(self, target_obj: str):
-        print(f"[BRAIN V16] Initializing for target: {target_obj}")
+        print(f"[BRAIN V17] Initializing for target: {target_obj}")
         
         self.depth_engine = MetricDepthEngine()
         self.obstacle_detector = EnhancedObstacleDetector()
@@ -1709,14 +1913,15 @@ class SafeVoxelBrain:
         self.visited = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.int8)
         self.confidence = np.zeros((GRID_SIZE, GRID_SIZE, HEIGHT_LEVELS), dtype=np.float32)
         
-        self.pid_yaw = PID(kp=0.8, ki=0.02, kd=0.12, limit=SPEED_YAW)
-        self.pid_vert = PID(kp=0.5, ki=0.01, kd=0.08, limit=SPEED_VERTICAL)  # Reduced for less bobbing
+        self.pid_yaw = PID(kp=0.8, ki=0.02, kd=0.12, limit=SPEED_YAW_FAST)
+        self.pid_vert = PID(kp=0.4, ki=0.01, kd=0.06, limit=SPEED_VERTICAL)  # Reduced for less bobbing
         
         self.mode = "INIT"
         self.sub_mode = ""
         self.escape_state = EscapeState.NONE
         self.escape_start_yaw = 0.0
         self.escape_target_rotation = 0.0
+        self.escape_start_time = 0.0  # V18: Track when escape started for timeout
         
         self.last_pos = (0.0, 0.0, 0.0)
         self.last_move_time = time.time()
@@ -1733,14 +1938,26 @@ class SafeVoxelBrain:
         self.current_world_path = []
         self.last_path_update = 0
         
-        # V16: Path always on
+        # V18: Target detection tracking
+        self.target_detected = False
+        self.last_target_seen_time = 0
+        self.target_detection_count = 0
+        
+        # V17: Path always on
         self.path_overlay_enabled = True
         self.default_target_set = False
         
-        # V16: Current altitude tracking
+        # V17: Current altitude tracking and lock
         self.current_altitude = 1.0
+        self.target_altitude = 1.0  # For altitude lock during rotation
+        self.altitude_locked = False
+        self.rotation_start_altitude = 1.0
         
-        print("[BRAIN V16] Ready - Veering + Ceiling Detection + 50% Faster")
+        # V17: Track if we're in rotation mode
+        self.is_rotating = False
+        self.rotation_start_time = 0
+        
+        print("[BRAIN V17] Ready - Adaptive Speed + Ceiling Protection + Advanced Pathfinding")
 
     @property
     def pos_x(self):
@@ -1838,7 +2055,7 @@ class SafeVoxelBrain:
         print(f"[PATH] Target set at world pos: ({target_world_x:.2f}, {target_world_z:.2f})")
 
     def _auto_set_default_target(self):
-        """V16: Automatically set a default target if none exists."""
+        """Automatically set a default target if none exists."""
         if self.target_world_pos is None and not self.default_target_set:
             # Set target 5m in front of current position
             target_x = self.pos_x + DEFAULT_TARGET_DISTANCE * np.sin(np.radians(-self.yaw))
@@ -1853,7 +2070,7 @@ class SafeVoxelBrain:
         
         self.last_path_update = time.time()
         
-        # V16: Auto-set target if needed
+        # Auto-set target if needed
         self._auto_set_default_target()
         
         if self.target_world_pos is None:
@@ -1862,7 +2079,7 @@ class SafeVoxelBrain:
         self.current_world_path = self.floor_map.find_path(self.pos_x, self.pos_z)
 
     def get_path_overlay(self, frame: np.ndarray) -> np.ndarray:
-        """V16: Always-on path overlay."""
+        """Always-on path overlay."""
         # Always try to show path
         if not self.floor_map.world_path:
             # Draw "No Path" indicator
@@ -1905,10 +2122,59 @@ class SafeVoxelBrain:
             'boxes': boxes
         }
 
+    def _start_rotation(self):
+        """V17: Start a rotation with altitude lock."""
+        if not self.is_rotating:
+            self.is_rotating = True
+            self.rotation_start_time = time.time()
+            self.rotation_start_altitude = self.current_altitude
+            self.target_altitude = self.current_altitude
+            self.altitude_locked = ROTATION_ALTITUDE_LOCK
+            print(f"[ALT LOCK] Rotation started, locking altitude at {self.target_altitude:.2f}m")
+    
+    def _end_rotation(self):
+        """V17: End rotation and release altitude lock."""
+        if self.is_rotating:
+            self.is_rotating = False
+            self.altitude_locked = False
+            print("[ALT LOCK] Rotation ended, releasing altitude lock")
+
+    def _compute_altitude_correction(self, obs: ObstacleInfo) -> int:
+        """
+        V17: Compute altitude correction with strict ceiling protection.
+        During rotation, maintains altitude lock to prevent rising.
+        """
+        # If altitude locked during rotation, maintain target altitude
+        if self.altitude_locked:
+            alt_error = self.target_altitude - self.current_altitude
+            
+            # Only correct if error is significant
+            if abs(alt_error) < ALTITUDE_HOLD_TOLERANCE:
+                return 0
+            
+            # Compute correction to maintain altitude
+            correction = int(np.clip(alt_error * 50, -SPEED_VERTICAL_SLOW, SPEED_VERTICAL_SLOW))
+            return correction
+        
+        # Check ceiling limit
+        if self.current_altitude >= MAX_ALTITUDE:
+            return -SPEED_VERTICAL_SLOW  # Force descent
+        
+        # Check floor limit  
+        if self.current_altitude <= MIN_ALTITUDE:
+            return SPEED_VERTICAL_SLOW  # Prevent crash
+        
+        return 0
+
     def _handle_corner_escape(self, obs: ObstacleInfo) -> Tuple[int, int, int, int]:
+        """V18: Corner escape with altitude lock and timeout to prevent infinite spinning."""
+        # Start rotation mode
+        self._start_rotation()
+        
         if self.escape_state == EscapeState.NONE:
             self.escape_state = EscapeState.CORNER_DETECTED
             self.escape_start_yaw = self.yaw
+            self.escape_start_time = time.time()  # V18: Record start time
             
             if obs.right_dist > obs.left_dist:
                 self.escape_state = EscapeState.ROTATING_RIGHT
@@ -1917,6 +2183,16 @@ class SafeVoxelBrain:
                 self.escape_state = EscapeState.ROTATING_LEFT
                 self.escape_target_rotation = -90
         
+        # V18: Check for timeout - force exit if spinning too long
+        escape_duration = time.time() - self.escape_start_time
+        if escape_duration > CORNER_ESCAPE_TIMEOUT:
+            print(f"[ESCAPE] Timeout after {escape_duration:.1f}s - forcing exit")
+            self.escape_state = EscapeState.ESCAPE_COMPLETE
+            self._end_rotation()
+            self.sub_mode = "TIMEOUT EXIT"
+            # Try moving forward slowly even if not clear
+            return (0, SPEED_VALUES[SpeedMode.CREEP], 0, 0)
+        
         rotation_done = self.yaw - self.escape_start_yaw
         
         while rotation_done > 180:
@@ -1924,29 +2200,37 @@ class SafeVoxelBrain:
         while rotation_done < -180:
             rotation_done += 360
         
+        # V17: Compute altitude correction during rotation
+        vert_correction = self._compute_altitude_correction(obs)
+        
+        # Check if front is now clear enough to exit
         if obs.center_dist > CORNER_ROTATION_THRESHOLD:
             self.escape_state = EscapeState.ESCAPE_COMPLETE
+            self._end_rotation()
             self.sub_mode = "ESCAPE COMPLETE"
-            return (0, SPEED_CAREFUL, 0, 0)
+            return (0, obs.recommended_speed, vert_correction, 0)
         
+        # V18: If rotated more than 270 degrees without finding exit, try alternate escape
         if abs(rotation_done) > 270:
-            if obs.can_go_up:
-                self.sub_mode = "ESCAPE UP"
-                return (0, 0, SPEED_VERTICAL, 0)
+            # Try reversing rotation direction
+            if self.escape_state == EscapeState.ROTATING_RIGHT:
+                self.escape_state = EscapeState.ROTATING_LEFT
+                self.sub_mode = "REVERSE ROT"
             else:
-                self.sub_mode = "FULL ROTATION"
+                self.escape_state = EscapeState.ROTATING_RIGHT
+                self.sub_mode = "REVERSE ROT"
         
         if self.escape_state == EscapeState.ROTATING_RIGHT:
-            self.sub_mode = f"ROT RIGHT {abs(rotation_done):.0f}°"
-            return (0, 0, 0, SPEED_ESCAPE_YAW)
+            self.sub_mode = f"ROT R {abs(rotation_done):.0f}° ({escape_duration:.1f}s)"
+            return (0, 0, vert_correction, SPEED_ESCAPE_YAW)
         else:
-            self.sub_mode = f"ROT LEFT {abs(rotation_done):.0f}°"
-            return (0, 0, 0, -SPEED_ESCAPE_YAW)
+            self.sub_mode = f"ROT L {abs(rotation_done):.0f}° ({escape_duration:.1f}s)"
+            return (0, 0, vert_correction, -SPEED_ESCAPE_YAW)
 
     def _compute_veering_command(self, obs: ObstacleInfo, base_forward: int) -> Tuple[int, int, int, int]:
         """
-        V16: Compute veering command - move forward while steering away from obstacles.
-        Returns (lateral, forward, vertical, yaw).
+        V17: Compute veering command with adaptive speed.
+        Speed is automatically reduced based on obstacle proximity.
         """
         lateral = 0
         yaw_cmd = 0
@@ -1954,26 +2238,42 @@ class SafeVoxelBrain:
         if obs.veer_direction == "left":
             # Veer left: negative lateral, positive yaw
             lateral = -int(SPEED_VEER_LATERAL * obs.veer_strength)
-            yaw_cmd = int(SPEED_YAW * 0.4 * obs.veer_strength)
+            yaw_cmd = int(SPEED_YAW_SLOW * 0.4 * obs.veer_strength)
         elif obs.veer_direction == "right":
             # Veer right: positive lateral, negative yaw
             lateral = int(SPEED_VEER_LATERAL * obs.veer_strength)
-            yaw_cmd = -int(SPEED_YAW * 0.4 * obs.veer_strength)
+            yaw_cmd = -int(SPEED_YAW_SLOW * 0.4 * obs.veer_strength)
         
-        # Reduce forward speed based on veer strength
-        forward = int(base_forward * (1.0 - 0.3 * obs.veer_strength))
+        # V17: Use adaptive speed instead of fixed reduction
+        # The base_forward is already adapted to obstacle distance
+        forward = int(base_forward * (1.0 - 0.2 * obs.veer_strength))
         
         return (lateral, forward, 0, yaw_cmd)
 
     def _compute_vertical_command(self, obs: ObstacleInfo, target_vert: int = 0) -> int:
         """
-        V16: Compute vertical command with ceiling protection and reduced bobbing.
+        V17: Compute vertical command with strict ceiling protection.
         """
+        # If altitude locked, use altitude correction
+        if self.altitude_locked:
+            return self._compute_altitude_correction(obs)
+        
         # Apply deadzone to reduce bobbing
         if abs(target_vert) < VERTICAL_DEADZONE * SPEED_VERTICAL:
             return 0
         
-        # Ceiling protection
+        # Ceiling protection - absolute limit
+        if self.current_altitude >= MAX_ALTITUDE - 0.1:
+            if target_vert > 0:
+                return -SPEED_VERTICAL_SLOW  # Force descent
+            return target_vert
+        
+        # Ceiling proximity - reduce up movement
+        if self.current_altitude >= MAX_ALTITUDE - 0.3:
+            if target_vert > 0:
+                return 0  # Stop rising
+        
+        # Check ceiling from obstacle detection
         if target_vert > 0 and not obs.can_go_up:
             return 0
         
@@ -1982,9 +2282,6 @@ class SafeVoxelBrain:
             return 0
         
         # Altitude limits
-        if self.current_altitude >= MAX_ALTITUDE and target_vert > 0:
-            return -SPEED_CAREFUL  # Go down
-        
         if self.current_altitude <= MIN_ALTITUDE and target_vert < 0:
             return 0
         
@@ -1993,7 +2290,7 @@ class SafeVoxelBrain:
 
     def get_action(self, frame: np.ndarray) -> Tuple[np.ndarray, Optional[any], Tuple[int, int, int, int], np.ndarray, np.ndarray]:
         """
-        V16: Main decision loop with veering behavior.
+        V17: Main decision loop with adaptive speed and ceiling protection.
         """
         depth_vis, depth_meters = self.depth_engine.infer(frame)
         obs = self.obstacle_detector.analyze(depth_meters, self.current_altitude)
@@ -2012,11 +2309,22 @@ class SafeVoxelBrain:
         target = self._detect_target(frame)
         targets = target['boxes'] if target else None
         
+        # V18: Track target detection for UI display
+        if targets and len(targets) > 0:
+            self.target_detected = True
+            self.last_target_seen_time = time.time()
+            self.target_detection_count += 1
+        
         self.update_path()
         path_overlay = self.get_path_overlay(frame)
         
+        # V17: Check if rotation is complete
         if self.escape_state != EscapeState.NONE and obs.center_dist > SAFE_DIST:
             self.escape_state = EscapeState.NONE
+            self._end_rotation()
+        
+        # V17: Get adaptive speed for this frame
+        adaptive_speed = obs.recommended_speed
         
         # ============= CORNER ESCAPE MODE =============
         if (obs.is_corner and self.obstacle_detector.is_stuck_in_corner()) or \
@@ -2026,84 +2334,90 @@ class SafeVoxelBrain:
             return (depth_vis, targets, rc, seg_vis, path_overlay)
         
         # ============= CEILING WARNING =============
-        if obs.ceiling_detected:
-            vert_correction = -SPEED_CAREFUL if self.current_altitude > MAX_ALTITUDE - 0.3 else 0
+        if obs.ceiling_detected or self.current_altitude >= MAX_ALTITUDE - 0.2:
+            vert_correction = -SPEED_VERTICAL_SLOW if self.current_altitude > MAX_ALTITUDE - 0.3 else 0
             if obs.is_emergency:
                 self.mode = "🛑 CEILING+EMERGENCY"
-                self.sub_mode = f"ALT:{self.current_altitude:.1f}m"
-                return depth_vis, targets, (0, SPEED_STOP, vert_correction, SPEED_YAW), seg_vis, path_overlay
+                self.sub_mode = f"ALT:{self.current_altitude:.1f}m (MAX:{MAX_ALTITUDE}m)"
+                self._start_rotation()  # Lock altitude
+                return depth_vis, targets, (0, SPEED_VALUES[SpeedMode.STOP], vert_correction, SPEED_YAW_NORMAL), seg_vis, path_overlay
         
         # ============= EMERGENCY STOP =============
         if obs.is_emergency or self.obstacle_detector.is_persistent_emergency():
             self.mode = "🛑 EMERGENCY"
             self.sub_mode = f"STOP @ {obs.center_dist:.2f}m"
             self.consecutive_safe_frames = 0
+            self._end_rotation()  # Not rotating
             
-            vert = self._compute_vertical_command(obs, SPEED_VERTICAL if obs.can_go_up else 0)
-            yaw_cmd = obs.escape_rotation if obs.escape_rotation != 0 else SPEED_YAW
+            vert = self._compute_vertical_command(obs, SPEED_VERTICAL_SLOW if obs.can_go_up else 0)
+            yaw_cmd = obs.escape_rotation if obs.escape_rotation != 0 else SPEED_YAW_NORMAL
             
-            return depth_vis, targets, (0, SPEED_STOP, vert, yaw_cmd), seg_vis, path_overlay
+            return depth_vis, targets, (0, SPEED_VALUES[SpeedMode.STOP], vert, yaw_cmd), seg_vis, path_overlay
         
-        # ============= CRITICAL - VEER AWAY =============
+        # ============= CRITICAL - SLOW VEER =============
         if obs.is_critical:
-            self.mode = "⚠️ CRITICAL VEER"
-            self.sub_mode = f"VEER @ {obs.center_dist:.2f}m"
+            self.mode = "⚠️ CRITICAL"
+            self.sub_mode = f"SLOW @ {obs.center_dist:.2f}m | {obs.speed_mode.value}"
             self.consecutive_safe_frames = 0
+            self._end_rotation()
             
-            # V16: Veer while maintaining some forward motion
-            lat, fwd, _, yaw_cmd = self._compute_veering_command(obs, SPEED_CREEP)
+            # V17: Use adaptive speed (will be CREEP or SLOW)
+            lat, fwd, _, yaw_cmd = self._compute_veering_command(obs, adaptive_speed)
             
             if yaw_cmd == 0:
-                yaw_cmd = SPEED_YAW if obs.right_dist > obs.left_dist else -SPEED_YAW
+                yaw_cmd = SPEED_YAW_SLOW if obs.right_dist > obs.left_dist else -SPEED_YAW_SLOW
             
             vert = self._compute_vertical_command(obs, 0)
             
             return depth_vis, targets, (lat, fwd, vert, yaw_cmd), seg_vis, path_overlay
         
-        # ============= DANGER - VEER =============
+        # ============= DANGER - CAREFUL VEER =============
         if obs.is_danger:
-            self.mode = "⚡ DANGER VEER"
-            self.sub_mode = f"AVOID @ {obs.center_dist:.2f}m"
+            self.mode = "⚡ DANGER"
+            self.sub_mode = f"CAREFUL @ {obs.center_dist:.2f}m | {obs.speed_mode.value}"
             self.consecutive_safe_frames = 0
+            self._end_rotation()
             
             if obs.thin_obstacle_detected:
                 self.sub_mode = f"POLE @ col{obs.thin_obstacle_column}"
                 lat = -SPEED_VEER_LATERAL if obs.thin_obstacle_column < THIN_OBSTACLE_COLUMNS // 2 else SPEED_VEER_LATERAL
-                yaw_cmd = SPEED_YAW if obs.thin_obstacle_column < THIN_OBSTACLE_COLUMNS // 2 else -SPEED_YAW
-                return depth_vis, targets, (lat, SPEED_CAREFUL, 0, yaw_cmd), seg_vis, path_overlay
+                yaw_cmd = SPEED_YAW_SLOW if obs.thin_obstacle_column < THIN_OBSTACLE_COLUMNS // 2 else -SPEED_YAW_SLOW
+                return depth_vis, targets, (lat, adaptive_speed, 0, yaw_cmd), seg_vis, path_overlay
             
             if target and target['size'] > 0.05:
                 self.mode = "🎯 CAREFUL"
                 h_err = target['cx'] - 0.5
                 yaw_cmd = int(self.pid_yaw.compute(h_err * 100))
-                return depth_vis, targets, (0, SPEED_CAREFUL, 0, yaw_cmd), seg_vis, path_overlay
+                return depth_vis, targets, (0, adaptive_speed, 0, yaw_cmd), seg_vis, path_overlay
             
-            # V16: Veer while maintaining forward motion
-            lat, fwd, _, yaw_cmd = self._compute_veering_command(obs, SPEED_CAREFUL)
+            # V17: Veer with adaptive speed
+            lat, fwd, _, yaw_cmd = self._compute_veering_command(obs, adaptive_speed)
             
             return depth_vis, targets, (lat, fwd, 0, yaw_cmd), seg_vis, path_overlay
         
-        # ============= CAUTION - MILD VEER =============
+        # ============= CAUTION - MODERATE SPEED =============
         if obs.is_caution:
             self.consecutive_safe_frames = 0
+            self._end_rotation()
             
             if target:
-                rc = self._handle_target(target, obs, speed_limit=SPEED_CAREFUL)
+                rc = self._handle_target(target, obs, speed_limit=adaptive_speed)
                 return depth_vis, targets, rc, seg_vis, path_overlay
             
-            self.mode = "👀 CAUTION VEER"
-            self.sub_mode = f"CAREFUL @ {obs.center_dist:.2f}m"
+            self.mode = "👀 CAUTION"
+            self.sub_mode = f"MODERATE @ {obs.center_dist:.2f}m | {obs.speed_mode.value}"
             
-            # V16: Mild veering while going forward
-            lat, fwd, _, yaw_cmd = self._compute_veering_command(obs, SPEED_CAREFUL)
+            # V17: Mild veering with adaptive speed
+            lat, fwd, _, yaw_cmd = self._compute_veering_command(obs, adaptive_speed)
             
             return depth_vis, targets, (lat, fwd, 0, yaw_cmd), seg_vis, path_overlay
         
-        # ============= SAFE - CRUISE =============
+        # ============= SAFE/CLEAR - ADAPTIVE SPEED =============
         self.consecutive_safe_frames += 1
+        self._end_rotation()
         
         if target:
-            rc = self._handle_target(target, obs, speed_limit=SPEED_CRUISE)
+            rc = self._handle_target(target, obs, speed_limit=adaptive_speed)
             return depth_vis, targets, rc, seg_vis, path_overlay
         
         # Stuck detection
@@ -2114,14 +2428,16 @@ class SafeVoxelBrain:
             if time.time() - self.last_move_time > STUCK_TIME:
                 self.mode = "🔄 UNSTUCK"
                 self.sub_mode = "ROTATING"
+                self._start_rotation()  # Lock altitude during unstuck rotation
                 self.last_move_time = time.time()
                 self.explore_direction *= -1
-                return depth_vis, targets, (0, 0, 0, SPEED_YAW * self.explore_direction), seg_vis, path_overlay
+                vert_correction = self._compute_altitude_correction(obs)
+                return depth_vis, targets, (0, 0, vert_correction, SPEED_YAW_NORMAL * self.explore_direction), seg_vis, path_overlay
         else:
             self.last_pos = (self.pos_x, self.pos_y, self.pos_z)
             self.last_move_time = time.time()
         
-        # Explore with optional veering
+        # Explore with adaptive speed
         rc = self._handle_explore(obs)
         return depth_vis, targets, rc, seg_vis, path_overlay
 
@@ -2138,8 +2454,8 @@ class SafeVoxelBrain:
         
         yaw_cmd = int(self.pid_yaw.compute(h_err * 100))
         
-        # V16: Reduced vertical command for less bobbing
-        raw_vert = int(self.pid_vert.compute(-v_err * 60))  # Reduced from 80
+        # V17: Reduced vertical command for less bobbing
+        raw_vert = int(self.pid_vert.compute(-v_err * 50))  # Reduced from 60
         vert_cmd = self._compute_vertical_command(obs, raw_vert) if not v_centered else 0
         
         if h_centered and v_centered and size_ok:
@@ -2154,8 +2470,9 @@ class SafeVoxelBrain:
                 self.sub_mode = "BLOCKED"
                 return (0, 0, vert_cmd, yaw_cmd)
             
+            # V17: Use adaptive speed for approach
             fwd = min(SPEED_APPROACH, speed_limit)
-            self.sub_mode = f"FWD @ {fwd}"
+            self.sub_mode = f"FWD @ {fwd} | {obs.speed_mode.value}"
             return (0, fwd, vert_cmd, yaw_cmd)
         
         self.mode = "🔍 TRACKING"
@@ -2163,27 +2480,28 @@ class SafeVoxelBrain:
         
         fwd = 0
         if size < GOAL_SIZE_TARGET * 0.4 and obs.center_dist > CAUTION_DIST:
-            fwd = SPEED_CAREFUL
+            fwd = min(obs.recommended_speed, speed_limit)
         
         return (0, fwd, vert_cmd, yaw_cmd)
 
     def _handle_explore(self, obs: ObstacleInfo) -> Tuple[int, int, int, int]:
-        """V16: Explore with smooth veering."""
+        """V17: Explore with adaptive speed based on obstacle proximity."""
         self.mode = "🔭 EXPLORE"
         
-        if obs.center_dist > SAFE_DIST and self.consecutive_safe_frames > 10:
-            speed = SPEED_CRUISE
-            self.sub_mode = f"CRUISE @ {obs.center_dist:.1f}m"
-        else:
-            speed = SPEED_CAREFUL
-            self.sub_mode = f"CAREFUL @ {obs.center_dist:.1f}m"
+        # V17: Use adaptive speed - faster when clear, slower near obstacles
+        speed = obs.recommended_speed
         
-        # V16: Apply veering if needed even in explore mode
+        if obs.is_clear:
+            self.sub_mode = f"FAST @ {obs.center_dist:.1f}m | {obs.speed_mode.value}"
+        else:
+            self.sub_mode = f"ADAPTIVE @ {obs.center_dist:.1f}m | {obs.speed_mode.value}"
+        
+        # Apply veering if needed even in explore mode
         if obs.veer_strength > 0.1:
             lat, fwd, _, yaw_cmd = self._compute_veering_command(obs, speed)
             return (lat, fwd, 0, yaw_cmd)
         
-        yaw_cmd = int(obs.steer_amount * SPEED_YAW * 0.4)
+        yaw_cmd = int(obs.steer_amount * SPEED_YAW_SLOW * 0.4)
         
         return (0, speed, 0, yaw_cmd)
 
@@ -2194,7 +2512,7 @@ class SafeVoxelBrain:
 class ManualController:
     def get_rc(self, keys) -> Tuple[int, int, int, int]:
         lat, fwd, vert, yaw = 0, 0, 0, 0
-        speed = 55  # Increased from 50
+        speed = 50
         
         if keys[pygame.K_w]: fwd = speed
         if keys[pygame.K_s]: fwd = -speed
@@ -2211,20 +2529,20 @@ class ManualController:
 
 
 # ==========================================
-# ENHANCED VISUALIZER V16
+# V17 ENHANCED VISUALIZER
 # ==========================================
 class Visualizer:
     def __init__(self):
         pygame.init()
         self.screen = pygame.display.set_mode((1500, 850))
-        pygame.display.set_caption("Tello V16.0 - Veering + Ceiling + Speed")
+        pygame.display.set_caption("Tello V17.0 - Adaptive Speed + Advanced Pathfinding")
         self.font = pygame.font.Font(None, 26)
         self.font_sm = pygame.font.Font(None, 20)
         self.font_lg = pygame.font.Font(None, 32)
         self.clock = pygame.time.Clock()
     
     def render(self, frame, depth, brain, targets, auto, battery, rc, obs_info, 
-               seg_vis=None, path_overlay=None):
+               seg_vis=None, path_overlay=None, cam_fps=0):
         self.screen.fill((15, 15, 20))
         
         # ======================
@@ -2248,7 +2566,7 @@ class Visualizer:
         self.screen.blit(surf, (10, 10))
         
         label_col = (0, 255, 255) if brain.floor_map.world_path else (180, 180, 180)
-        self.screen.blit(self.font.render("Camera + Path (Always On)", True, label_col), (10, 405))
+        self.screen.blit(self.font.render("Camera + Path (V17 B-Spline)", True, label_col), (10, 405))
         
         if seg_vis is not None:
             seg_small = cv2.resize(seg_vis, (255, 190))
@@ -2309,7 +2627,7 @@ class Visualizer:
         floor_vis_small = cv2.resize(floor_vis, (200, 200), interpolation=cv2.INTER_NEAREST)
         surf_floor = pygame.surfarray.make_surface(np.transpose(floor_vis_small, (1, 0, 2)))
         self.screen.blit(surf_floor, (550, 240))
-        self.screen.blit(self.font_sm.render("Floor Map + Path", True, (180, 180, 180)), (550, 445))
+        self.screen.blit(self.font_sm.render("Floor Map + Smooth Path", True, (180, 180, 180)), (550, 445))
         
         # ======================
         # RIGHT COLUMN - Status
@@ -2317,12 +2635,31 @@ class Visualizer:
         col_x = 780
         y = 10
         
-        self.screen.blit(self.font_lg.render("TELLO V16.0", True, (100, 200, 255)), (col_x, y))
+        self.screen.blit(self.font_lg.render("TELLO V17.1", True, (100, 200, 255)), (col_x, y))
         y += 35
+        
+        # V18: TARGET DETECTION STATUS PANEL
+        pygame.draw.rect(self.screen, (40, 40, 50), (col_x - 5, y - 5, 220, 55))
+        if brain.target_detected:
+            time_since = time.time() - brain.last_target_seen_time
+            if time_since < 2.0:
+                target_col = (0, 255, 0)  # Green - just seen
+                status = "TARGET VISIBLE"
+            else:
+                target_col = (255, 255, 0)  # Yellow - seen recently
+                status = f"LAST SEEN {time_since:.1f}s"
+            self.screen.blit(self.font.render(f"🎯 {status}", True, target_col), (col_x, y))
+            y += 22
+            self.screen.blit(self.font_sm.render(f"Detections: {brain.target_detection_count}", True, (150, 255, 150)), (col_x, y))
+        else:
+            self.screen.blit(self.font.render("🔍 SEARCHING...", True, (150, 150, 150)), (col_x, y))
+            y += 22
+            self.screen.blit(self.font_sm.render("No target detected yet", True, (100, 100, 100)), (col_x, y))
+        y += 30
         
         mode_col = (0, 255, 0) if auto else (100, 100, 255)
         self.screen.blit(self.font.render(
-            f"{'AUTO (VEER+FAST)' if auto else 'MANUAL'}", True, mode_col), (col_x, y))
+            f"{'AUTO (ADAPTIVE)' if auto else 'MANUAL'}", True, mode_col), (col_x, y))
         y += 30
         
         state_col = (255, 0, 0) if "EMERGENCY" in brain.mode else \
@@ -2336,13 +2673,32 @@ class Visualizer:
         self.screen.blit(self.font_sm.render(brain.sub_mode, True, (150, 150, 150)), (col_x, y))
         y += 30
         
-        # V16: Ceiling indicator
+        # V17: Speed mode indicator with color
+        speed_colors = {
+            SpeedMode.STOP: (255, 0, 0),
+            SpeedMode.CREEP: (255, 100, 0),
+            SpeedMode.SLOW: (255, 200, 0),
+            SpeedMode.CRUISE: (100, 255, 100),
+            SpeedMode.FAST: (0, 255, 0),
+        }
+        speed_col = speed_colors.get(obs_info.speed_mode, (180, 180, 180))
+        self.screen.blit(self.font.render(
+            f"SPEED: {obs_info.speed_mode.value} ({obs_info.recommended_speed})", True, speed_col), (col_x, y))
+        y += 25
+        
+        # V17: Altitude lock indicator
+        if brain.altitude_locked:
+            self.screen.blit(self.font_sm.render(
+                f"🔒 ALT LOCKED: {brain.target_altitude:.2f}m", True, (255, 255, 0)), (col_x, y))
+            y += 20
+        
+        # V17: Ceiling indicator
         if obs_info.ceiling_detected:
             self.screen.blit(self.font_sm.render(
                 f"⚠️ CEILING: {obs_info.ceiling_dist:.2f}m", True, (255, 255, 0)), (col_x, y))
             y += 20
         
-        # V16: Veering indicator
+        # Veering indicator
         if obs_info.veer_strength > 0.1:
             veer_text = f"VEER {obs_info.veer_direction.upper()}: {obs_info.veer_strength:.0%}"
             self.screen.blit(self.font_sm.render(veer_text, True, (0, 255, 255)), (col_x, y))
@@ -2379,7 +2735,7 @@ class Visualizer:
             True, (180, 180, 180)), (col_x, y))
         y += 18
         
-        # V16: Altitude with limit indicator
+        # V17: Altitude with limit indicator
         alt_col = (255, 255, 0) if brain.current_altitude > MAX_ALTITUDE - 0.3 else (180, 180, 180)
         self.screen.blit(self.font_sm.render(
             f"Altitude: {brain.current_altitude:.2f}m (max {MAX_ALTITUDE}m)", True, alt_col), (col_x, y))
@@ -2388,18 +2744,21 @@ class Visualizer:
             f"Yaw: {brain.yaw:.0f}°", True, (180, 180, 180)), (col_x, y))
         y += 30
         
-        self.screen.blit(self.font_sm.render("─── Path Planning ───", True, (100, 100, 100)), (col_x, y))
+        self.screen.blit(self.font_sm.render("─── Pathfinding V17 ───", True, (100, 100, 100)), (col_x, y))
         y += 20
         
-        if brain.floor_engine.enabled:
-            self.screen.blit(self.font_sm.render("Floor Seg: ✓ Enabled", True, (0, 255, 0)), (col_x, y))
-        else:
-            self.screen.blit(self.font_sm.render("Floor Seg: ✗ Disabled", True, (255, 100, 100)), (col_x, y))
+        path_features = []
+        if PATH_STRING_PULL_ENABLED:
+            path_features.append("StringPull")
+        if PATH_BSPLINE_ENABLED and SCIPY_AVAILABLE:
+            path_features.append("B-Spline")
+        path_text = " + ".join(path_features) if path_features else "A* Only"
+        self.screen.blit(self.font_sm.render(f"Path: {path_text}", True, (0, 255, 0)), (col_x, y))
         y += 18
         
         path_len = len(brain.floor_map.world_path)
         if path_len > 0:
-            self.screen.blit(self.font_sm.render(f"Path: {path_len} waypoints (ALWAYS ON)", True, (0, 255, 255)), (col_x, y))
+            self.screen.blit(self.font_sm.render(f"Waypoints: {path_len} (smoothed)", True, (0, 255, 255)), (col_x, y))
         else:
             self.screen.blit(self.font_sm.render("Path: Building...", True, (255, 255, 0)), (col_x, y))
         y += 30
@@ -2414,14 +2773,19 @@ class Visualizer:
         
         batt_col = (0, 255, 0) if battery > 30 else (255, 165, 0) if battery > 15 else (255, 0, 0)
         self.screen.blit(self.font.render(f"BATTERY: {battery}%", True, batt_col), (col_x, y))
-        y += 30
+        y += 25
+        
+        # V17: Video FPS indicator
+        fps_col = (0, 255, 0) if cam_fps > 25 else (255, 255, 0) if cam_fps > 15 else (255, 0, 0)
+        self.screen.blit(self.font_sm.render(f"Video FPS: {cam_fps:.1f}", True, fps_col), (col_x, y))
+        y += 18
         
         model_text = "METRIC DEPTH ✓" if brain.depth_engine.is_metric else "RELATIVE DEPTH"
         model_col = (0, 255, 100) if brain.depth_engine.is_metric else (255, 150, 0)
         self.screen.blit(self.font_sm.render(model_text, True, model_col), (col_x, y))
         y += 18
         
-        self.screen.blit(self.font_sm.render("OFFLINE MODE ✓ | 50% FASTER", True, (0, 200, 100)), (col_x, y))
+        self.screen.blit(self.font_sm.render("OFFLINE MODE ✓ | LOW-LATENCY VIDEO", True, (0, 200, 100)), (col_x, y))
         y += 40
         
         # ======================
@@ -2433,9 +2797,9 @@ class Visualizer:
             "[WASD] Move  [Arrows] Vert/Yaw  [SHIFT] Fast",
             f"Target: {brain.target_obj}",
             "[T] Set target at current direction",
-            "V16: 50% FASTER | VEERING | CEILING DETECTION",
-            "Path overlay ALWAYS ON - auto-sets target",
-            "Ceiling limit: 2.0m | Reduced bobbing"
+            "V17: ADAPTIVE SPEED | CEILING PROTECTION | B-SPLINE PATHS",
+            f"Speed zones: STOP<{EMERGENCY_STOP_DIST}m | SLOW<{DANGER_DIST}m | CRUISE<{SAFE_DIST}m | FAST>{CLEAR_DIST}m",
+            f"Max altitude: {MAX_ALTITUDE}m | Altitude lock during rotation"
         ]
         for txt in instructions:
             self.screen.blit(self.font_sm.render(txt, True, (100, 100, 100)), (10, y))
@@ -2450,14 +2814,22 @@ class Visualizer:
 # ==========================================
 def main():
     print("=" * 60)
-    print("  TELLO V16.0: VEERING + SPEED + CEILING")
+    print("  TELLO V17.0: ADAPTIVE SPEED + ADVANCED PATHFINDING")
     print("=" * 60)
-    print("  V16 IMPROVEMENTS:")
-    print("  - 50% FASTER: All speeds increased")
-    print("  - VEERING: Smooth obstacle avoidance while moving")
-    print("  - CEILING: Won't crash into ceiling (2m limit)")
-    print("  - ALWAYS-ON PATH: Auto-sets target, always displays")
-    print("  - REDUCED BOBBING: Damped vertical oscillation")
+    print("  V17 IMPROVEMENTS:")
+    print("  - ADAPTIVE SPEED: Auto-adjusts based on obstacle distance")
+    print(f"    * FAST when clear (>{CLEAR_DIST}m)")
+    print(f"    * CRUISE when safe ({SAFE_DIST}-{CLEAR_DIST}m)")
+    print(f"    * SLOW when danger (<{DANGER_DIST}m)")
+    print(f"    * STOP in emergency (<{EMERGENCY_STOP_DIST}m)")
+    print("  - CEILING PROTECTION: Strict altitude limits during rotation")
+    print(f"    * Max altitude: {MAX_ALTITUDE}m")
+    print("    * Altitude lock during all rotations")
+    print("  - IMPROVED PATHFINDING:")
+    print("    * A* search")
+    print("    * String Pulling (removes unnecessary waypoints)")
+    print("    * B-Spline smoothing (rounds corners)")
+    print("  - LOW-LATENCY VIDEO: Optimized capture settings")
     print("")
     print("  CONTROLS:")
     print("  - [T] Set target at current direction")
@@ -2511,6 +2883,7 @@ def main():
                         brain.pid_yaw.reset()
                         brain.pid_vert.reset()
                         brain.escape_state = EscapeState.NONE
+                        brain._end_rotation()  # Release any altitude lock
                     if event.key == pygame.K_t:
                         target_x = brain.pos_x + DEFAULT_TARGET_DISTANCE * np.sin(np.radians(-brain.yaw))
                         target_z = brain.pos_z - DEFAULT_TARGET_DISTANCE * np.cos(np.radians(-brain.yaw))
@@ -2567,8 +2940,10 @@ def main():
             except:
                 battery = 0
             
+            cam_fps = cam.get_fps()
+            
             viz.render(frame, depth_vis, brain, targets, auto_mode, battery, rc_cmd, 
-                      obs_info, seg_vis, path_overlay)
+                      obs_info, seg_vis, path_overlay, cam_fps)
     
     finally:
         print("[SHUTDOWN] Cleaning up...")

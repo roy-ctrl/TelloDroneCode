@@ -1,21 +1,30 @@
 """
-Tello EDU: Autonomous V18.0 "Column Depth + Decisive Navigation"
+Tello EDU: Autonomous V18.1 "Person-to-Goal Path Projection"
 ===================================================================
 Hardware: RTX 4060 8GB VRAM | Python 3.13
 
-NEW FEATURES IN V18.0:
-1. COLUMN DEPTH VISUALIZATION: 12-column depth analysis with visual overlay
-2. DECISIVE OBSTACLE AVOIDANCE: Actual rotation when obstacles detected
-3. SMART EXPLORATION: Prioritize furthest depth, avoid re-exploring
-4. EMERGENCY STOP: Absolute stop when <0.5m (no exceptions)
-5. GPU OPTIMIZATION: torch.compile, batched inference, max GPU utilization
-6. VERTICAL AVOIDANCE: Go up/down over obstacles when possible
+NEW FEATURES IN V18.1:
+1. PERSON-TO-GOAL PATH: Projects A* path from detected PERSON to GOAL
+2. PERSON DETECTION: Always-on YOLO World person detection
+3. PATH VISUALIZATION TOGGLE: Press T to toggle path overlay on/off
+4. PATHFINDING STATUS LOGGING: Detailed status in visualization window
+5. 3D POSITION ESTIMATION: Estimates person's world position from depth
+6. WORKS WITHOUT GOAL IN VIEW: Projects path onto ground plane
 
-CORE LOGIC (SIMPLE):
-- Explore: Move towards furthest clear depth
-- Speed: Fast when clear, slow when obstacles near
-- Avoid: Rotate towards clearest column
-- Emergency: STOP immediately when <0.5m
+INHERITED FROM V18.0:
+- COLUMN DEPTH VISUALIZATION: 12-column depth analysis with visual overlay
+- DECISIVE OBSTACLE AVOIDANCE: Actual rotation when obstacles detected
+- SMART EXPLORATION: Prioritize furthest depth, avoid re-exploring
+- EMERGENCY STOP: Absolute stop when <0.5m (no exceptions)
+- GPU OPTIMIZATION: torch.compile, batched inference, max GPU utilization
+- VERTICAL AVOIDANCE: Go up/down over obstacles when possible
+
+CORE LOGIC:
+- Detect person in frame using YOLO World
+- Estimate person's 3D world position from depth map
+- Plan A* path from person position to goal
+- Visualize path projection on camera view
+- Toggle visualization with T key
 """
 
 import os
@@ -141,7 +150,7 @@ STUCK_THRESHOLD = 0.1
 STUCK_TIME = 2.5
 
 # Path planning
-PATH_UPDATE_INTERVAL = 0.5
+PATH_UPDATE_INTERVAL = 0.3  # Faster updates for person tracking
 DEFAULT_TARGET_DISTANCE = 5.0
 PATH_STRING_PULL_ENABLED = True
 PATH_BSPLINE_ENABLED = True
@@ -151,10 +160,15 @@ PATH_BSPLINE_SMOOTHNESS = 0.0
 # Path visualization colors
 PATH_LINE_COLOR = (0, 255, 255)  # Yellow
 PATH_POINT_COLOR = (0, 255, 0)   # Green
-PATH_START_COLOR = (255, 0, 0)   # Blue
+PATH_START_COLOR = (255, 0, 0)   # Blue (person position)
 PATH_GOAL_COLOR = (0, 0, 255)    # Red
 PATH_LINE_THICKNESS = 3
 PATH_POINT_RADIUS = 8
+
+# Person detection
+PERSON_CLASS = "person"
+PERSON_CONFIDENCE_THRESHOLD = 0.4
+PERSON_DEPTH_PERCENTILE = 30  # Use lower percentile for more accurate depth
 
 # Floor classes
 FLOOR_CLASS_IDS = {3: "floor", 28: "rug", 6: "road", 11: "sidewalk", 13: "ground"}
@@ -163,6 +177,74 @@ FLOOR_CLASS_IDS = {3: "floor", 28: "rug", 6: "road", 11: "sidewalk", 13: "ground
 logging.getLogger('djitellopy').setLevel(logging.ERROR)
 logging.getLogger("ultralytics").setLevel(logging.WARNING)
 logging.getLogger("transformers").setLevel(logging.WARNING)
+
+
+# ==========================================
+# PATHFINDING STATUS LOGGER
+# ==========================================
+@dataclass
+class PathfindingStatus:
+    """Status information for pathfinding algorithm."""
+    person_detected: bool = False
+    person_world_pos: Optional[Tuple[float, float, float]] = None
+    person_screen_pos: Optional[Tuple[int, int]] = None
+    person_depth: float = 0.0
+    goal_set: bool = False
+    goal_world_pos: Optional[Tuple[float, float]] = None
+    path_found: bool = False
+    path_length: int = 0
+    path_distance: float = 0.0
+    astar_iterations: int = 0
+    string_pull_applied: bool = False
+    bspline_applied: bool = False
+    last_update_time: float = 0.0
+    computation_time_ms: float = 0.0
+    error_message: str = ""
+    
+    def get_status_lines(self) -> List[str]:
+        """Get status as list of strings for display."""
+        lines = []
+        
+        # Person status
+        if self.person_detected:
+            lines.append(f"👤 Person: DETECTED")
+            if self.person_world_pos:
+                px, py, pz = self.person_world_pos
+                lines.append(f"   World: ({px:.2f}, {py:.2f}, {pz:.2f})")
+            lines.append(f"   Depth: {self.person_depth:.2f}m")
+        else:
+            lines.append("👤 Person: NOT FOUND")
+        
+        # Goal status
+        if self.goal_set and self.goal_world_pos:
+            gx, gz = self.goal_world_pos
+            lines.append(f"🎯 Goal: ({gx:.2f}, {gz:.2f})")
+        else:
+            lines.append("🎯 Goal: NOT SET")
+        
+        # Path status
+        if self.path_found:
+            lines.append(f"📍 Path: {self.path_length} waypoints")
+            lines.append(f"   Distance: {self.path_distance:.2f}m")
+            lines.append(f"   A* iters: {self.astar_iterations}")
+            opts = []
+            if self.string_pull_applied:
+                opts.append("StringPull")
+            if self.bspline_applied:
+                opts.append("B-Spline")
+            if opts:
+                lines.append(f"   Opts: {', '.join(opts)}")
+        else:
+            lines.append("📍 Path: NO PATH")
+        
+        # Timing
+        lines.append(f"⏱️ Compute: {self.computation_time_ms:.1f}ms")
+        
+        # Error
+        if self.error_message:
+            lines.append(f"⚠️ {self.error_message}")
+        
+        return lines
 
 
 # ==========================================
@@ -207,41 +289,52 @@ class AStarPathfinder:
             (1, 1), (1, -1), (-1, 1), (-1, -1)
         ]
         self.direction_costs = [1.0, 1.0, 1.0, 1.0, 1.414, 1.414, 1.414, 1.414]
+        
+        # Statistics for logging
+        self.last_iterations = 0
     
     def heuristic(self, a: Tuple[int, int], b: Tuple[int, int]) -> float:
         return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
     
     def find_path(self, floor_grid: np.ndarray, start: Tuple[int, int], 
-                  goal: Tuple[int, int], obstacle_grid: np.ndarray = None) -> List[Tuple[int, int]]:
-        """Find path from start to goal with string pulling and B-spline smoothing."""
+                  goal: Tuple[int, int], obstacle_grid: np.ndarray = None) -> Tuple[List[Tuple[int, int]], bool, bool]:
+        """
+        Find path from start to goal with string pulling and B-spline smoothing.
+        Returns: (path, string_pull_applied, bspline_applied)
+        """
+        string_pull_applied = False
+        bspline_applied = False
+        
         if not self._is_valid(start, floor_grid, obstacle_grid):
             start = self._find_nearest_valid(start, floor_grid, obstacle_grid)
             if start is None:
-                return []
+                return [], False, False
         
         if not self._is_valid(goal, floor_grid, obstacle_grid):
             goal = self._find_nearest_valid(goal, floor_grid, obstacle_grid)
             if goal is None:
-                return []
+                return [], False, False
         
         # Step 1: A* search
         raw_path = self._astar_search(floor_grid, start, goal, obstacle_grid)
         if not raw_path:
-            return []
+            return [], False, False
         
         # Step 2: String Pulling
         if PATH_STRING_PULL_ENABLED and len(raw_path) > 2:
             pulled_path = self._string_pull(raw_path, floor_grid, obstacle_grid)
+            string_pull_applied = len(pulled_path) < len(raw_path)
         else:
             pulled_path = raw_path
         
         # Step 3: B-Spline smoothing
         if PATH_BSPLINE_ENABLED and SCIPY_AVAILABLE and len(pulled_path) > 3:
             smoothed_path = self._bspline_smooth(pulled_path)
+            bspline_applied = True
         else:
             smoothed_path = pulled_path
         
-        return smoothed_path
+        return smoothed_path, string_pull_applied, bspline_applied
     
     def _astar_search(self, floor_grid: np.ndarray, start: Tuple[int, int],
                       goal: Tuple[int, int], obstacle_grid: np.ndarray) -> List[Tuple[int, int]]:
@@ -263,6 +356,7 @@ class AStarPathfinder:
             open_set_hash.remove(current)
             
             if current == goal:
+                self.last_iterations = iterations
                 path = []
                 while current in came_from:
                     path.append(current)
@@ -288,6 +382,7 @@ class AStarPathfinder:
                         heapq.heappush(open_set, (f_score[neighbor], neighbor))
                         open_set_hash.add(neighbor)
         
+        self.last_iterations = iterations
         return []
     
     def _string_pull(self, path: List[Tuple[int, int]], floor_grid: np.ndarray,
@@ -393,6 +488,108 @@ class AStarPathfinder:
 
 
 # ==========================================
+# PERSON POSITION ESTIMATOR
+# ==========================================
+class PersonPositionEstimator:
+    """
+    Estimates 3D world position of detected person from:
+    1. 2D bounding box center
+    2. Depth map
+    3. Camera intrinsics
+    """
+    
+    def __init__(self):
+        self.fx = FX
+        self.fy = FY
+        self.cx = CX
+        self.cy = CY
+        
+        # Smoothing for stable position
+        self.position_history = deque(maxlen=5)
+        self.last_valid_position = None
+    
+    def estimate_world_position(self, bbox: Tuple[float, float, float, float],
+                                 depth_meters: np.ndarray,
+                                 drone_x: float, drone_y: float, drone_z: float,
+                                 drone_yaw: float) -> Optional[Tuple[float, float, float]]:
+        """
+        Estimate person's world position from bounding box and depth.
+        
+        Args:
+            bbox: (x1, y1, x2, y2) bounding box
+            depth_meters: Depth map in meters
+            drone_x, drone_y, drone_z: Drone position
+            drone_yaw: Drone yaw angle in degrees
+            
+        Returns:
+            (world_x, world_y, world_z) or None if estimation fails
+        """
+        x1, y1, x2, y2 = bbox
+        h, w = depth_meters.shape
+        
+        # Get bounding box center
+        cx = int((x1 + x2) / 2)
+        cy = int((y1 + y2) / 2)
+        
+        # Clamp to image bounds
+        cx = max(0, min(w - 1, cx))
+        cy = max(0, min(h - 1, cy))
+        
+        # Get depth at center region (use percentile for robustness)
+        # Sample a region around the center
+        margin_x = int((x2 - x1) * 0.2)
+        margin_y = int((y2 - y1) * 0.2)
+        
+        roi_x1 = max(0, cx - margin_x)
+        roi_x2 = min(w, cx + margin_x)
+        roi_y1 = max(0, cy - margin_y)
+        roi_y2 = min(h, cy + margin_y)
+        
+        depth_roi = depth_meters[roi_y1:roi_y2, roi_x1:roi_x2]
+        
+        if depth_roi.size == 0:
+            return None
+        
+        # Use percentile to filter outliers
+        person_depth = float(np.percentile(depth_roi, PERSON_DEPTH_PERCENTILE))
+        
+        if person_depth < 0.3 or person_depth > 15.0:
+            return None
+        
+        # Convert 2D + depth to 3D camera coordinates
+        # Using pinhole camera model
+        cam_x = (cx - self.cx) * person_depth / self.fx
+        cam_y = (cy - self.cy) * person_depth / self.fy
+        cam_z = person_depth
+        
+        # Transform to world coordinates
+        yaw_rad = np.radians(-drone_yaw)
+        c, s = np.cos(yaw_rad), np.sin(yaw_rad)
+        
+        # Rotate camera coordinates to world frame
+        world_x = cam_x * c - cam_z * s + drone_x
+        world_z = cam_x * s + cam_z * c + drone_z
+        world_y = drone_y - cam_y  # Y is up, camera Y is down
+        
+        # Apply temporal smoothing
+        self.position_history.append((world_x, world_y, world_z))
+        
+        if len(self.position_history) >= 2:
+            positions = np.array(list(self.position_history))
+            smoothed = np.mean(positions, axis=0)
+            result = (float(smoothed[0]), float(smoothed[1]), float(smoothed[2]))
+        else:
+            result = (world_x, world_y, world_z)
+        
+        self.last_valid_position = result
+        return result
+    
+    def get_floor_position(self, world_pos: Tuple[float, float, float]) -> Tuple[float, float]:
+        """Project world position to floor plane (y=0)."""
+        return (world_pos[0], world_pos[2])
+
+
+# ==========================================
 # PATH PROJECTION ENGINE
 # ==========================================
 class PathProjectionEngine:
@@ -460,8 +657,9 @@ class PathProjectionEngine:
     
     def draw_path_on_image(self, image: np.ndarray,
                            image_points: List[Tuple[int, int]],
-                           valid_mask: List[bool]) -> np.ndarray:
-        """Draw projected path on image."""
+                           valid_mask: List[bool],
+                           person_screen_pos: Optional[Tuple[int, int]] = None) -> np.ndarray:
+        """Draw projected path on image with person marker."""
         if not image_points:
             return image
         
@@ -484,19 +682,24 @@ class PathProjectionEngine:
             cv2.circle(result, pt, radius, PATH_POINT_COLOR, -1)
             cv2.circle(result, pt, radius + 2, (255, 255, 255), 1)
         
-        # Draw start marker
+        # Draw person start marker (first point)
         if valid_points:
             _, start_pt = valid_points[0]
             cv2.circle(result, start_pt, PATH_POINT_RADIUS + 4, PATH_START_COLOR, -1)
-            cv2.putText(result, "START", (start_pt[0] + 15, start_pt[1]),
+            cv2.putText(result, "PERSON", (start_pt[0] + 15, start_pt[1]),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        # Draw goal marker
+        # Draw goal marker (last point)
         if len(valid_points) > 1:
             _, goal_pt = valid_points[-1]
             cv2.circle(result, goal_pt, PATH_POINT_RADIUS + 4, PATH_GOAL_COLOR, -1)
             cv2.putText(result, "GOAL", (goal_pt[0] + 15, goal_pt[1]),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Draw person bounding box marker if provided
+        if person_screen_pos:
+            px, py = person_screen_pos
+            cv2.drawMarker(result, (px, py), (255, 0, 255), cv2.MARKER_CROSS, 30, 3)
         
         return result
 
@@ -1083,10 +1286,10 @@ class VisualOdometry:
 
 
 # ==========================================
-# FLOOR MAP & PATH PLANNING
+# FLOOR MAP & PATH PLANNING (PERSON-TO-GOAL)
 # ==========================================
 class FloorMap3D:
-    """3D floor map with A* path planning."""
+    """3D floor map with A* path planning from PERSON to GOAL."""
     
     def __init__(self):
         self.floor_grid = np.zeros((FLOOR_GRID_SIZE, FLOOR_GRID_SIZE), dtype=np.float32)
@@ -1097,26 +1300,21 @@ class FloorMap3D:
         self.scene_points = []
         self.scene_colors = []
         
-        # Path planning
+        # Path planning - PERSON to GOAL
         self.pathfinder = AStarPathfinder(FLOOR_GRID_SIZE)
-        self.target_position: Optional[Tuple[int, int]] = None
-        self.start_position: Optional[Tuple[int, int]] = None
+        self.goal_position: Optional[Tuple[int, int]] = None  # Goal grid position
+        self.goal_world_pos: Optional[Tuple[float, float]] = None  # Goal world position
+        self.person_position: Optional[Tuple[int, int]] = None  # Person grid position
+        self.person_world_pos: Optional[Tuple[float, float]] = None  # Person world position
         self.current_path: List[Tuple[int, int]] = []
         self.world_path: List[Tuple[float, float]] = []
         
         self.lock = threading.Lock()
-        print("[FLOOR MAP] Initialized with A* pathfinding")
+        print("[FLOOR MAP] Initialized with Person-to-Goal A* pathfinding")
     
     def update(self, depth_meters: np.ndarray, floor_mask: np.ndarray,
                pos_x: float, pos_y: float, pos_z: float, yaw: float):
         h, w = depth_meters.shape
-        
-        # Set start position
-        if self.start_position is None:
-            self.start_position = (
-                int(pos_x / FLOOR_VOXEL_RES + FLOOR_CENTER),
-                int(pos_z / FLOOR_VOXEL_RES + FLOOR_CENTER)
-            )
         
         ds = 8
         depth_ds = cv2.resize(depth_meters, (w // ds, h // ds), interpolation=cv2.INTER_NEAREST)
@@ -1179,31 +1377,41 @@ class FloorMap3D:
             for i, j in zip(obs_ix[valid_obs], obs_iz[valid_obs]):
                 self.obstacle_grid[j, i] = min(self.obstacle_grid[j, i] + 0.1, 1.0)
     
-    def set_target(self, world_x: float, world_z: float):
-        """Set target position in world coordinates."""
+    def set_goal(self, world_x: float, world_z: float):
+        """Set goal position in world coordinates."""
         ix = int(world_x / FLOOR_VOXEL_RES + FLOOR_CENTER)
         iz = int(world_z / FLOOR_VOXEL_RES + FLOOR_CENTER)
-        self.target_position = (ix, iz)
-        print(f"[PATH] Target set at grid ({ix}, {iz})")
+        self.goal_position = (ix, iz)
+        self.goal_world_pos = (world_x, world_z)
+        print(f"[PATH] Goal set at world ({world_x:.2f}, {world_z:.2f}) -> grid ({ix}, {iz})")
     
-    def find_path(self, drone_x: float, drone_z: float) -> List[Tuple[float, float]]:
-        """Find path from drone position to target."""
-        if self.target_position is None:
-            return []
-        
-        start_x = int(drone_x / FLOOR_VOXEL_RES + FLOOR_CENTER)
-        start_z = int(drone_z / FLOOR_VOXEL_RES + FLOOR_CENTER)
+    def set_person_position(self, world_x: float, world_z: float):
+        """Set person position in world coordinates."""
+        ix = int(world_x / FLOOR_VOXEL_RES + FLOOR_CENTER)
+        iz = int(world_z / FLOOR_VOXEL_RES + FLOOR_CENTER)
+        self.person_position = (ix, iz)
+        self.person_world_pos = (world_x, world_z)
+    
+    def find_path_from_person(self) -> Tuple[List[Tuple[float, float]], bool, bool, int]:
+        """
+        Find path from person position to goal.
+        Returns: (world_path, string_pull_applied, bspline_applied, iterations)
+        """
+        if self.person_position is None or self.goal_position is None:
+            return [], False, False, 0
         
         with self.lock:
-            grid_path = self.pathfinder.find_path(
+            grid_path, string_pull, bspline = self.pathfinder.find_path(
                 self.floor_grid,
-                (start_x, start_z),
-                self.target_position,
+                self.person_position,
+                self.goal_position,
                 (self.obstacle_grid > 0.5).astype(np.float32)
             )
         
         if not grid_path:
-            return []
+            self.current_path = []
+            self.world_path = []
+            return [], False, False, self.pathfinder.last_iterations
         
         # Convert grid path to world path
         world_path = []
@@ -1214,7 +1422,19 @@ class FloorMap3D:
         
         self.current_path = grid_path
         self.world_path = world_path
-        return world_path
+        return world_path, string_pull, bspline, self.pathfinder.last_iterations
+    
+    def get_path_distance(self) -> float:
+        """Calculate total path distance in meters."""
+        if len(self.world_path) < 2:
+            return 0.0
+        
+        total = 0.0
+        for i in range(len(self.world_path) - 1):
+            x1, z1 = self.world_path[i]
+            x2, z2 = self.world_path[i + 1]
+            total += math.sqrt((x2 - x1)**2 + (z2 - z1)**2)
+        return total
     
     def get_visualization_2d(self) -> np.ndarray:
         vis = np.zeros((FLOOR_GRID_SIZE, FLOOR_GRID_SIZE, 3), dtype=np.uint8)
@@ -1228,17 +1448,17 @@ class FloorMap3D:
                 if 0 <= gx < FLOOR_GRID_SIZE and 0 <= gz < FLOOR_GRID_SIZE:
                     cv2.circle(vis, (gx, gz), 2, (0, 255, 255), -1)
             
-            # Draw start
-            if self.start_position:
-                sx, sz = self.start_position
-                if 0 <= sx < FLOOR_GRID_SIZE and 0 <= sz < FLOOR_GRID_SIZE:
-                    cv2.circle(vis, (sx, sz), 5, (255, 255, 0), -1)
+            # Draw person position (start of path)
+            if self.person_position:
+                px, pz = self.person_position
+                if 0 <= px < FLOOR_GRID_SIZE and 0 <= pz < FLOOR_GRID_SIZE:
+                    cv2.circle(vis, (px, pz), 5, (255, 0, 255), -1)  # Magenta for person
             
-            # Draw target
-            if self.target_position:
-                tx, tz = self.target_position
+            # Draw goal
+            if self.goal_position:
+                tx, tz = self.goal_position
                 if 0 <= tx < FLOOR_GRID_SIZE and 0 <= tz < FLOOR_GRID_SIZE:
-                    cv2.circle(vis, (tx, tz), 5, (255, 0, 0), -1)
+                    cv2.circle(vis, (tx, tz), 5, (255, 0, 0), -1)  # Blue for goal
         
         return vis
 
@@ -1355,22 +1575,22 @@ class ThreadedCam:
 
 
 # ==========================================
-# V18 DECISIVE NAVIGATION BRAIN
+# V18.1 PERSON-TO-GOAL BRAIN
 # ==========================================
 class DecisiveBrain:
     """
-    V18 Brain: Simple, decisive navigation with A* path planning.
+    V18.1 Brain: Person-to-Goal path planning with decisive navigation.
     
     Core logic:
-    1. Analyze 12 depth columns
-    2. Find clearest path
-    3. Navigate towards it with appropriate speed
-    4. STOP immediately on emergency
-    5. Plan paths using A* with B-spline smoothing
+    1. Always detect PERSON using YOLO World
+    2. Estimate person's 3D world position from depth
+    3. Plan A* path from PERSON to GOAL
+    4. Visualize path projection on camera
+    5. Standard obstacle avoidance for drone
     """
     
     def __init__(self, target_obj: str):
-        print(f"[BRAIN V18] Initializing for target: {target_obj}")
+        print(f"[BRAIN V18.1] Initializing for target: {target_obj}")
         
         # Core engines
         self.depth_engine = GPUDepthEngine()
@@ -1380,15 +1600,17 @@ class DecisiveBrain:
         self.floor_engine = FloorSegmentationEngine()
         self.floor_map = FloorMap3D()
         self.path_projector = PathProjectionEngine()
+        self.person_estimator = PersonPositionEstimator()
         
         # 3D visualization
         self.vis3d = Open3DVisualizer(self.floor_map) if OPEN3D_AVAILABLE else None
         
-        # YOLO for target detection
+        # YOLO for person detection (always on) + target detection
         self.yolo = YOLOWorld('yolov8s-world.pt')
-        self.yolo.set_classes([target_obj])
-        self.yolo.to('cuda' if torch.cuda.is_available() else 'cpu')
+        # Set classes: always detect person, plus the target object
         self.target_obj = target_obj
+        self.yolo.set_classes([PERSON_CLASS, target_obj])
+        self.yolo.to('cuda' if torch.cuda.is_available() else 'cpu')
         
         # State
         self.mode = "INIT"
@@ -1401,10 +1623,20 @@ class DecisiveBrain:
         
         # Path planning state
         self.last_path_update = 0
-        self.target_world_pos = None
-        self.default_target_set = False
+        self.goal_set = False
         
-        print("[BRAIN V18] Ready - Decisive Navigation + A* Pathfinding Active")
+        # Path visualization toggle
+        self.show_path_visualization = True
+        
+        # Pathfinding status for logging
+        self.path_status = PathfindingStatus()
+        
+        # Person detection state
+        self.last_person_detection = None
+        self.person_lost_time = 0
+        
+        print("[BRAIN V18.1] Ready - Person-to-Goal Path Planning Active")
+        print(f"[BRAIN V18.1] Detecting: {PERSON_CLASS} + {target_obj}")
     
     @property
     def pos_x(self): return self.vo.pos_x
@@ -1423,6 +1655,12 @@ class DecisiveBrain:
         if self.vis3d:
             self.vis3d.stop()
     
+    def toggle_path_visualization(self):
+        """Toggle path overlay on/off."""
+        self.show_path_visualization = not self.show_path_visualization
+        state = "ON" if self.show_path_visualization else "OFF"
+        print(f"[PATH VIS] Path visualization: {state}")
+    
     def update_vo(self, frame, imu_yaw, imu_height=None):
         self.vo.update(frame, imu_yaw, imu_height)
         if imu_height:
@@ -1430,39 +1668,174 @@ class DecisiveBrain:
         if self.vis3d:
             self.vis3d.update_drone_position(self.pos_x, self.pos_y, self.pos_z, self.yaw)
     
-    def set_target_from_direction(self):
-        """Set target in current facing direction."""
+    def set_goal_from_direction(self):
+        """Set goal in current facing direction."""
         target_x = self.pos_x + DEFAULT_TARGET_DISTANCE * np.sin(np.radians(-self.yaw))
         target_z = self.pos_z - DEFAULT_TARGET_DISTANCE * np.cos(np.radians(-self.yaw))
-        self.target_world_pos = (target_x, target_z)
-        self.floor_map.set_target(target_x, target_z)
-        self.default_target_set = True
-        print(f"[PATH] Target set {DEFAULT_TARGET_DISTANCE}m ahead at ({target_x:.2f}, {target_z:.2f})")
+        self.floor_map.set_goal(target_x, target_z)
+        self.goal_set = True
+        self.path_status.goal_set = True
+        self.path_status.goal_world_pos = (target_x, target_z)
+        print(f"[PATH] Goal set {DEFAULT_TARGET_DISTANCE}m ahead at ({target_x:.2f}, {target_z:.2f})")
     
-    def update_path(self):
-        """Update path planning."""
+    def _detect_objects(self, frame: np.ndarray) -> Tuple[Optional[dict], Optional[dict], any]:
+        """
+        Detect person and target object in frame.
+        Returns: (person_info, target_info, all_boxes)
+        """
+        results = self.yolo.predict(frame, verbose=False, conf=PERSON_CONFIDENCE_THRESHOLD, half=True)
+        
+        if not results or len(results[0].boxes) == 0:
+            return None, None, None
+        
+        boxes = results[0].boxes
+        h, w = frame.shape[:2]
+        
+        person_info = None
+        target_info = None
+        
+        # Find largest person and target
+        for box in boxes:
+            cls_id = int(box.cls[0])
+            cls_name = self.yolo.names[cls_id] if hasattr(self.yolo, 'names') else ""
+            
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            area = (x2 - x1) * (y2 - y1)
+            
+            info = {
+                'bbox': (x1, y1, x2, y2),
+                'cx': (x1 + x2) / 2 / w,
+                'cy': (y1 + y2) / 2 / h,
+                'size': area / (w * h),
+                'class': cls_name
+            }
+            
+            # Check if it's a person
+            if cls_id == 0 or cls_name.lower() == PERSON_CLASS:
+                if person_info is None or info['size'] > person_info['size']:
+                    person_info = info
+            # Check if it's the target object
+            elif cls_name.lower() == self.target_obj.lower():
+                if target_info is None or info['size'] > target_info['size']:
+                    target_info = info
+        
+        return person_info, target_info, boxes
+    
+    def update_person_path(self, frame: np.ndarray, depth_meters: np.ndarray, 
+                           person_info: Optional[dict]) -> bool:
+        """
+        Update path from detected person to goal.
+        Returns True if path was updated successfully.
+        """
+        start_time = time.time()
+        
+        # Reset status
+        self.path_status.error_message = ""
+        
+        if person_info is None:
+            self.path_status.person_detected = False
+            self.path_status.person_world_pos = None
+            self.path_status.person_screen_pos = None
+            self.path_status.path_found = False
+            
+            # Use last known position if recent
+            if self.person_lost_time == 0:
+                self.person_lost_time = time.time()
+            
+            if time.time() - self.person_lost_time > 2.0:
+                self.path_status.error_message = "Person lost for >2s"
+                self.floor_map.current_path = []
+                self.floor_map.world_path = []
+            
+            return False
+        
+        self.person_lost_time = 0
+        self.path_status.person_detected = True
+        
+        # Get person screen position
+        bbox = person_info['bbox']
+        screen_cx = int((bbox[0] + bbox[2]) / 2)
+        screen_cy = int((bbox[1] + bbox[3]) / 2)
+        self.path_status.person_screen_pos = (screen_cx, screen_cy)
+        
+        # Estimate person's world position
+        person_world = self.person_estimator.estimate_world_position(
+            bbox, depth_meters, self.pos_x, self.pos_y, self.pos_z, self.yaw
+        )
+        
+        if person_world is None:
+            self.path_status.error_message = "Failed to estimate depth"
+            return False
+        
+        self.path_status.person_world_pos = person_world
+        
+        # Get depth at person
+        h, w = depth_meters.shape
+        roi_cx = max(0, min(w-1, screen_cx))
+        roi_cy = max(0, min(h-1, screen_cy))
+        self.path_status.person_depth = float(depth_meters[roi_cy, roi_cx])
+        
+        # Set person floor position for path planning
+        floor_pos = self.person_estimator.get_floor_position(person_world)
+        self.floor_map.set_person_position(floor_pos[0], floor_pos[1])
+        
+        # Check if goal is set
+        if not self.goal_set:
+            self.path_status.goal_set = False
+            self.path_status.error_message = "Goal not set (press G)"
+            return False
+        
+        # Rate limit path updates
         if time.time() - self.last_path_update < PATH_UPDATE_INTERVAL:
-            return
+            return True
         
         self.last_path_update = time.time()
         
-        # Auto-set default target if none exists
-        if self.target_world_pos is None and not self.default_target_set:
-            self.set_target_from_direction()
+        # Find path from person to goal
+        world_path, string_pull, bspline, iterations = self.floor_map.find_path_from_person()
         
-        if self.target_world_pos is None:
-            return
+        # Update status
+        self.path_status.astar_iterations = iterations
+        self.path_status.string_pull_applied = string_pull
+        self.path_status.bspline_applied = bspline
         
-        # Find path to target
-        self.floor_map.find_path(self.pos_x, self.pos_z)
+        if world_path:
+            self.path_status.path_found = True
+            self.path_status.path_length = len(world_path)
+            self.path_status.path_distance = self.floor_map.get_path_distance()
+        else:
+            self.path_status.path_found = False
+            self.path_status.path_length = 0
+            self.path_status.path_distance = 0.0
+            self.path_status.error_message = "No valid path found"
+        
+        # Timing
+        self.path_status.computation_time_ms = (time.time() - start_time) * 1000
+        self.path_status.last_update_time = time.time()
+        
+        return self.path_status.path_found
     
-    def get_path_overlay(self, frame: np.ndarray) -> np.ndarray:
+    def get_path_overlay(self, frame: np.ndarray, person_info: Optional[dict]) -> np.ndarray:
         """Draw path overlay on camera frame."""
+        if not self.show_path_visualization:
+            return frame.copy()
+        
         if not self.floor_map.world_path:
             result = frame.copy()
-            cv2.putText(result, "No Path - Press T to set target", (20, 50),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            # Show status even without path
+            if not self.goal_set:
+                cv2.putText(result, "Press G to set goal", (20, 50),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            elif not self.path_status.person_detected:
+                cv2.putText(result, "Looking for person...", (20, 50),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            else:
+                cv2.putText(result, "Building path...", (20, 50),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             return result
+        
+        # Get person screen position for marker
+        person_screen = self.path_status.person_screen_pos
         
         image_points, valid_mask = self.path_projector.project_path(
             self.floor_map.world_path,
@@ -1472,26 +1845,16 @@ class DecisiveBrain:
             image_height=frame.shape[0]
         )
         
-        return self.path_projector.draw_path_on_image(frame, image_points, valid_mask)
-    
-    def _detect_target(self, frame):
-        results = self.yolo.predict(frame, verbose=False, conf=0.35, half=True)
-        if not results or len(results[0].boxes) == 0:
-            return None
+        result = self.path_projector.draw_path_on_image(frame, image_points, valid_mask, person_screen)
         
-        boxes = results[0].boxes
-        best = max(boxes, key=lambda b: (b.xyxy[0][2] - b.xyxy[0][0]) * (b.xyxy[0][3] - b.xyxy[0][1]))
+        # Draw person bounding box
+        if person_info:
+            x1, y1, x2, y2 = [int(v) for v in person_info['bbox']]
+            cv2.rectangle(result, (x1, y1), (x2, y2), (255, 0, 255), 2)
+            cv2.putText(result, "PERSON", (x1, y1 - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
         
-        h, w = frame.shape[:2]
-        x1, y1, x2, y2 = best.xyxy[0].cpu().numpy()
-        
-        return {
-            'bbox': (x1, y1, x2, y2),
-            'cx': (x1 + x2) / 2 / w,
-            'cy': (y1 + y2) / 2 / h,
-            'size': (x2 - x1) * (y2 - y1) / (w * h),
-            'boxes': boxes
-        }
+        return result
     
     def _can_go_over(self, column_info: ColumnDepthInfo) -> bool:
         """Check if obstacle can be overcome by going up."""
@@ -1504,10 +1867,10 @@ class DecisiveBrain:
         return (column_info.is_blocked and 
                 self.current_altitude > MIN_ALTITUDE + 0.3)
     
-    def get_action(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, any, Tuple[int, int, int, int], np.ndarray]:
+    def get_action(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, any, Tuple[int, int, int, int], np.ndarray, Optional[dict]]:
         """
         Main decision loop.
-        Returns: (depth_vis, column_vis, path_overlay, targets, rc_command, seg_vis)
+        Returns: (depth_vis, column_vis, path_overlay, targets, rc_command, seg_vis, person_info)
         """
         # Run depth inference
         depth_vis, depth_meters = self.depth_engine.infer(frame)
@@ -1533,15 +1896,14 @@ class DecisiveBrain:
         # Update floor map
         self.floor_map.update(depth_meters, floor_mask, self.pos_x, self.pos_y, self.pos_z, self.yaw)
         
-        # Update path planning
-        self.update_path()
+        # Detect person and target
+        person_info, target_info, boxes = self._detect_objects(frame)
+        
+        # Update person-to-goal path
+        self.update_person_path(frame, depth_meters, person_info)
         
         # Get path overlay
-        path_overlay = self.get_path_overlay(frame)
-        
-        # Detect target
-        target = self._detect_target(frame)
-        targets = target['boxes'] if target else None
+        path_overlay = self.get_path_overlay(frame, person_info)
         
         # ===== DECISIVE NAVIGATION =====
         
@@ -1552,19 +1914,19 @@ class DecisiveBrain:
             self.mode = "🛑 EMERGENCY"
             fwd = SPEED_STOP
             yaw_cmd = column_info.recommended_yaw
-            return depth_vis, column_vis, path_overlay, targets, (0, 0, 0, yaw_cmd), seg_vis
+            return depth_vis, column_vis, path_overlay, boxes, (0, 0, 0, yaw_cmd), seg_vis, person_info
         
         # Check if stuck
         if self.explorer.is_stuck(self.pos_x, self.pos_y, self.pos_z):
             self.mode = "🔄 UNSTUCK"
             rc = self.explorer.get_unstuck_action()
-            return depth_vis, column_vis, path_overlay, targets, rc, seg_vis
+            return depth_vis, column_vis, path_overlay, boxes, rc, seg_vis, person_info
         
-        # TARGET TRACKING
-        if target:
+        # TARGET TRACKING (original target object, not person)
+        if target_info:
             self.mode = "🎯 TARGET"
-            h_err = target['cx'] - 0.5
-            v_err = target['cy'] - 0.5
+            h_err = target_info['cx'] - 0.5
+            v_err = target_info['cy'] - 0.5
             
             yaw_cmd = int(h_err * 80)
             vert = int(-v_err * 40)
@@ -1573,7 +1935,7 @@ class DecisiveBrain:
                 if column_info.center_depth > CRITICAL_DIST:
                     fwd = min(column_info.recommended_speed, SPEED_SLOW)
             
-            return depth_vis, column_vis, path_overlay, targets, (0, fwd, vert, yaw_cmd), seg_vis
+            return depth_vis, column_vis, path_overlay, boxes, (0, fwd, vert, yaw_cmd), seg_vis, person_info
         
         # BLOCKED: Try vertical escape
         if column_info.is_blocked:
@@ -1592,7 +1954,7 @@ class DecisiveBrain:
                 yaw_cmd = column_info.recommended_yaw
                 fwd = 0  # STOP forward movement while rotating away from obstacle
             
-            return depth_vis, column_vis, path_overlay, targets, (0, fwd, vert, yaw_cmd), seg_vis
+            return depth_vis, column_vis, path_overlay, boxes, (0, fwd, vert, yaw_cmd), seg_vis, person_info
         
         # EXPLORE: Move towards furthest depth
         self.mode = f"🔭 EXPLORE ({column_info.best_direction})"
@@ -1606,7 +1968,7 @@ class DecisiveBrain:
         elif self.current_altitude < MIN_ALTITUDE + 0.2:
             vert = VERT_SLOW
         
-        return depth_vis, column_vis, path_overlay, targets, (0, fwd, vert, yaw_cmd), seg_vis
+        return depth_vis, column_vis, path_overlay, boxes, (0, fwd, vert, yaw_cmd), seg_vis, person_info
 
 
 # ==========================================
@@ -1632,20 +1994,21 @@ class ManualController:
 
 
 # ==========================================
-# V18 VISUALIZER WITH COLUMN VIEW
+# V18.1 VISUALIZER WITH PATH STATUS LOGGING
 # ==========================================
 class Visualizer:
     def __init__(self):
         pygame.init()
         self.screen = pygame.display.set_mode((1600, 900))
-        pygame.display.set_caption("Tello V18.0 - Column Depth + A* Pathfinding")
+        pygame.display.set_caption("Tello V18.1 - Person-to-Goal Path Planning")
         self.font = pygame.font.Font(None, 26)
         self.font_sm = pygame.font.Font(None, 20)
         self.font_lg = pygame.font.Font(None, 32)
+        self.font_xs = pygame.font.Font(None, 18)
         self.clock = pygame.time.Clock()
     
     def render(self, frame, depth_vis, column_vis, path_overlay, brain, targets, auto, battery, rc, 
-               column_info, seg_vis=None, cam_fps=0):
+               column_info, seg_vis=None, cam_fps=0, person_info=None):
         self.screen.fill((15, 15, 20))
         
         # ===== LEFT TOP: Column Visualization =====
@@ -1668,8 +2031,10 @@ class Visualizer:
             surf_path = pygame.surfarray.make_surface(
                 np.transpose(cv2.cvtColor(path_view, cv2.COLOR_BGR2RGB), (1, 0, 2)))
             self.screen.blit(surf_path, (10, 400))
+            
+            vis_state = "ON" if brain.show_path_visualization else "OFF"
             path_count = len(brain.floor_map.world_path)
-            path_text = f"A* Path ({path_count} waypoints)" if path_count > 0 else "Path: Building..."
+            path_text = f"Person→Goal Path ({path_count} pts) [T: {vis_state}]"
             self.screen.blit(self.font.render(path_text, True, (0, 255, 255)), (10, 765))
         
         # ===== MIDDLE TOP: Depth Map =====
@@ -1695,6 +2060,8 @@ class Visualizer:
         
         # ===== MIDDLE: Floor Map with Path =====
         floor_vis = brain.floor_map.get_visualization_2d()
+        
+        # Draw drone position
         rx = np.clip(int(brain.pos_x / VOXEL_RES) + CENTER, 2, GRID_SIZE - 3)
         rz = np.clip(int(brain.pos_z / VOXEL_RES) + CENTER, 2, GRID_SIZE - 3)
         cv2.circle(floor_vis, (rx, rz), 4, (0, 255, 255), -1)
@@ -1707,14 +2074,16 @@ class Visualizer:
         surf = pygame.transform.scale(
             pygame.surfarray.make_surface(np.transpose(floor_vis, (1, 0, 2))), (280, 280))
         self.screen.blit(surf, (500, 490))
-        self.screen.blit(self.font_sm.render("Floor Map + A* Path", True, (180, 180, 180)), (500, 775))
+        self.screen.blit(self.font_sm.render("Floor Map + Person Path", True, (180, 180, 180)), (500, 775))
         
         # ===== RIGHT: Status Panel =====
         col_x = 800
         y = 10
         
-        self.screen.blit(self.font_lg.render("TELLO V18.0", True, (100, 200, 255)), (col_x, y))
-        y += 35
+        self.screen.blit(self.font_lg.render("TELLO V18.1", True, (100, 200, 255)), (col_x, y))
+        y += 25
+        self.screen.blit(self.font_sm.render("Person-to-Goal Path", True, (150, 150, 150)), (col_x, y))
+        y += 25
         
         # Mode
         mode_col = (0, 255, 0) if auto else (100, 100, 255)
@@ -1726,14 +2095,35 @@ class Visualizer:
                     (255, 128, 0) if "ROTATING" in brain.mode or "BLOCKED" in brain.mode else \
                     (0, 255, 0) if "TARGET" in brain.mode else (200, 200, 200)
         self.screen.blit(self.font.render(brain.mode, True, state_col), (col_x, y))
-        y += 35
+        y += 30
         
-        # Column depths bar graph
+        # ===== PATHFINDING STATUS SECTION =====
+        self.screen.blit(self.font_sm.render("─── Pathfinding Status ───", True, (100, 100, 100)), (col_x, y))
+        y += 18
+        
+        status_lines = brain.path_status.get_status_lines()
+        for line in status_lines:
+            # Color code based on content
+            if "NOT FOUND" in line or "NOT SET" in line or "NO PATH" in line:
+                color = (255, 100, 100)
+            elif "DETECTED" in line or "waypoints" in line:
+                color = (100, 255, 100)
+            elif "⚠️" in line:
+                color = (255, 200, 100)
+            else:
+                color = (180, 180, 180)
+            
+            self.screen.blit(self.font_xs.render(line, True, color), (col_x, y))
+            y += 16
+        
+        y += 10
+        
+        # ===== Column depths bar graph =====
         self.screen.blit(self.font_sm.render("─── Column Depths ───", True, (100, 100, 100)), (col_x, y))
         y += 20
         
         bar_width = 25
-        bar_max_height = 80
+        bar_max_height = 60
         for i, depth in enumerate(column_info.depths):
             # Normalize depth to bar height (0-4m range)
             bar_height = int(min(depth / 4.0, 1.0) * bar_max_height)
@@ -1774,10 +2164,6 @@ class Visualizer:
             f"Center: {column_info.center_depth:.2f}m", True, (180, 180, 180)), (col_x, y))
         y += 18
         self.screen.blit(self.font_sm.render(
-            f"L: {column_info.left_avg:.2f}m  R: {column_info.right_avg:.2f}m", 
-            True, (180, 180, 180)), (col_x, y))
-        y += 18
-        self.screen.blit(self.font_sm.render(
             f"Direction: {column_info.best_direction.upper()}", True, (0, 255, 0)), (col_x, y))
         y += 25
         
@@ -1789,7 +2175,7 @@ class Visualizer:
         y += 25
         
         # Position
-        self.screen.blit(self.font_sm.render("─── Position ───", True, (100, 100, 100)), (col_x, y))
+        self.screen.blit(self.font_sm.render("─── Drone Position ───", True, (100, 100, 100)), (col_x, y))
         y += 20
         self.screen.blit(self.font_sm.render(
             f"X: {brain.pos_x:.2f}  Y: {brain.pos_y:.2f}  Z: {brain.pos_z:.2f}",
@@ -1807,7 +2193,7 @@ class Visualizer:
         self.screen.blit(self.font_sm.render(
             f"L={rc[0]:+3d} F={rc[1]:+3d} V={rc[2]:+3d} Y={rc[3]:+3d}",
             True, fwd_color), (col_x, y))
-        y += 30
+        y += 25
         
         # Battery
         batt_col = (0, 255, 0) if battery > 30 else (255, 165, 0) if battery > 15 else (255, 0, 0)
@@ -1829,9 +2215,9 @@ class Visualizer:
         # ===== BOTTOM: Instructions =====
         y = 800
         instructions = [
-            "[SPACE] Takeoff/Land  [M] Auto/Manual  [T] Set Target  [ESC] Quit",
+            "[SPACE] Takeoff/Land  [M] Auto/Manual  [G] Set Goal  [T] Toggle Path Vis  [ESC] Quit",
             "[WASD] Move  [Arrows] Vert/Yaw  [SHIFT] Fast",
-            f"Target: {brain.target_obj} | V18: COLUMN DEPTH + A* PATHFINDING + B-SPLINE"
+            f"Detecting: PERSON + {brain.target_obj} | V18.1: PERSON-TO-GOAL PATH PLANNING"
         ]
         for txt in instructions:
             self.screen.blit(self.font_sm.render(txt, True, (100, 100, 100)), (10, y))
@@ -1850,21 +2236,27 @@ class Visualizer:
 # ==========================================
 def main():
     print("=" * 60)
-    print("  TELLO V18.0: COLUMN DEPTH + A* PATHFINDING")
+    print("  TELLO V18.1: PERSON-TO-GOAL PATH PROJECTION")
     print("=" * 60)
     print()
     print("  KEY FEATURES:")
-    print("  - 12-COLUMN DEPTH ANALYSIS with visual overlay")
-    print("  - DECISIVE OBSTACLE AVOIDANCE (actual rotation)")
-    print("  - EMERGENCY STOP at <0.5m (no exceptions)")
+    print("  - PERSON DETECTION: Always-on YOLO World person detection")
+    print("  - PERSON-TO-GOAL PATH: A* path from detected person to goal")
+    print("  - PATH VISUALIZATION: Toggle with [T] key")
+    print("  - PATHFINDING STATUS: Detailed logging in visualization")
+    print("  - 3D POSITION ESTIMATION: Person world position from depth")
+    print()
+    print("  INHERITED FROM V18.0:")
+    print("  - 12-COLUMN DEPTH ANALYSIS")
+    print("  - DECISIVE OBSTACLE AVOIDANCE")
+    print("  - EMERGENCY STOP at <0.5m")
     print("  - A* PATHFINDING with String Pulling + B-Spline")
-    print("  - PATH VISUALIZATION on camera view")
-    print("  - GPU-OPTIMIZED inference")
     print()
     print("  CONTROLS:")
     print("  - [SPACE] Takeoff/Land")
     print("  - [M] Toggle Auto/Manual")
-    print("  - [T] Set target in current direction")
+    print("  - [G] Set goal in current direction")
+    print("  - [T] Toggle path visualization ON/OFF")
     print("  - [WASD] Move  [Arrows] Vert/Yaw")
     print("=" * 60)
     
@@ -1894,8 +2286,9 @@ def main():
     column_info = ColumnDepthInfo()
     seg_vis = None
     path_overlay = None
+    person_info = None
     
-    print("[READY] Press SPACE to takeoff, M for auto mode, T to set target")
+    print("[READY] Press SPACE to takeoff, M for auto mode, G to set goal, T to toggle path viz")
     
     try:
         while running:
@@ -1912,8 +2305,10 @@ def main():
                     if event.key == pygame.K_m:
                         auto_mode = not auto_mode
                         drone.send_rc_control(0, 0, 0, 0)
+                    if event.key == pygame.K_g:
+                        brain.set_goal_from_direction()
                     if event.key == pygame.K_t:
-                        brain.set_target_from_direction()
+                        brain.toggle_path_visualization()
                     if event.key == pygame.K_ESCAPE:
                         running = False
             
@@ -1934,7 +2329,7 @@ def main():
             brain.update_vo(frame, imu_yaw, imu_height)
             
             if auto_mode and drone.is_flying:
-                depth_vis, column_vis, path_overlay, targets, rc_cmd, seg_vis = brain.get_action(frame)
+                depth_vis, column_vis, path_overlay, targets, rc_cmd, seg_vis, person_info = brain.get_action(frame)
                 column_info = brain.column_analyzer.analyze(
                     brain.depth_engine.infer(frame)[1])
                 
@@ -1952,16 +2347,21 @@ def main():
                 column_info = brain.column_analyzer.analyze(depth_m)
                 column_vis = brain.column_analyzer.get_column_visualization(frame, depth_m, column_info)
                 
-                # Update path in manual mode too
+                # Detect person and update path in manual mode too
+                person_info_manual, _, boxes = brain._detect_objects(frame)
+                brain.update_person_path(frame, depth_m, person_info_manual)
+                person_info = person_info_manual
+                
+                # Update floor map
                 brain.floor_map.update(depth_m, np.zeros(frame.shape[:2], dtype=np.uint8), 
                                        brain.pos_x, brain.pos_y, brain.pos_z, brain.yaw)
-                brain.update_path()
-                path_overlay = brain.get_path_overlay(frame)
+                
+                path_overlay = brain.get_path_overlay(frame, person_info)
                 
                 if brain.floor_engine.enabled:
                     _, seg_vis = brain.floor_engine.segment_floor(frame)
                 
-                targets = None
+                targets = boxes
             
             try:
                 battery = drone.get_battery()
@@ -1971,7 +2371,7 @@ def main():
             cam_fps = cam.get_fps()
             
             viz.render(frame, depth_vis, column_vis, path_overlay, brain, targets, auto_mode, 
-                      battery, rc_cmd, column_info, seg_vis, cam_fps)
+                      battery, rc_cmd, column_info, seg_vis, cam_fps, person_info)
     
     finally:
         print("[SHUTDOWN] Cleaning up...")
